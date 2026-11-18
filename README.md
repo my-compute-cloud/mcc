@@ -18,7 +18,7 @@ This repository is the agent's complete source, so you can read what it does bef
   images and which GitHub organizations are allowed, and during which hours. See
   [docs/agent.md](docs/agent.md).
 
-It does not read your files, does not need root, and does not update itself.
+It does not read your files, does not run as root, and does not update itself.
 
 ## Requirements
 
@@ -26,9 +26,6 @@ An Apple Silicon Mac with [Tart](https://tart.run) installed. Linux and Windows 
 planned.
 
 ## Install
-
-> The first signed release is being prepared. Until it is published, the commands below will
-> not find anything to install; build from source instead.
 
 Homebrew:
 
