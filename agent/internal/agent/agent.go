@@ -115,10 +115,14 @@ func New(o Options) *Agent {
 // until ctx ends. On return all VMs it started have been stopped.
 func (a *Agent) Run(ctx context.Context) error {
 	if a.o.Policy.NetworkIsolation() && !a.isolationOK {
+		why := "this host cannot isolate VMs from its network"
+		if e, ok := a.o.Executor.(interface{ NetworkIsolationMissing() string }); ok {
+			why = e.NetworkIsolationMissing()
+		}
 		if a.o.Policy.RequireNetworkIsolation {
-			a.log.Error("network isolation is required by policy but Softnet is not set up; VMs will be refused")
+			a.log.Error("network isolation is required by policy but unavailable; VMs will be refused: " + why)
 		} else {
-			a.log.Warn("network isolation unavailable: VMs will share the host's network. See docs/agent.md to enable Softnet.")
+			a.log.Warn("network isolation unavailable: " + why)
 		}
 	}
 	a.cleanupLeftovers(ctx)

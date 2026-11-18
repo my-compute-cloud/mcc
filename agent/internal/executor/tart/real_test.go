@@ -116,11 +116,10 @@ echo "sdk=$(xcrun --sdk macosx --show-sdk-version)"
 }
 
 // realLinuxScript does in a Linux guest what the agent's entry command does before the runner
-// starts (mount the shares, link the cache, read the image's job environment), then checks
+// starts (link the cache, read the image's job environment), then checks
 // the disk, the cache, and that preloaded container images are there without a pull.
 func realLinuxScript(wantGB int, preload []string) string {
 	script := `set -euo pipefail
-sudo mkdir -p /mnt/mcc && sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/mcc
 ln -sfn /mnt/mcc/mcc-cache "$HOME/.mcc-cache"
 export MCC_CACHE_DIR="$HOME/.mcc-cache"
 if [ -r /etc/mcc/job-env ]; then . /etc/mcc/job-env; fi

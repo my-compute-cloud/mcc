@@ -48,7 +48,7 @@ type AssignmentReport struct {
 type ImageSpec struct {
 	// Stable image name within the tenant
 	Name string `json:"name"`
-	// OCI reference, for example ghcr.io/cirruslabs/macos-sequoia-xcode:latest
+	// Where this host fetches the image, for example ghcr.io/cirruslabs/macos-sequoia-xcode:latest. The control plane has already chosen the source for this host's system
 	Source string `json:"source"`
 	// Guest OS: darwin or linux
 	Platform string `json:"platform"`

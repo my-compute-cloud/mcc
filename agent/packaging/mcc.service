@@ -1,0 +1,36 @@
+# systemd unit for the My Compute Cloud agent on a Linux host.
+#
+# It runs `mcc run` as the unprivileged user "mcc", whose home /var/lib/mcc holds the agent's
+# key, state, images and job cache. Set up once:
+#
+#   sudo useradd --system --create-home --home-dir /var/lib/mcc --shell /usr/sbin/nologin mcc
+#   sudo install -m 644 mcc.service /etc/systemd/system/mcc.service   (this file)
+#   sudo -u mcc env MCC_HOME=/var/lib/mcc mcc enroll --server URL TOKEN
+#   sudo systemctl enable --now mcc
+#
+# Until the host is enrolled the unit does not start. Logs: journalctl -u mcc
+
+[Unit]
+Description=My Compute Cloud agent
+Documentation=https://github.com/my-compute-cloud/mcc/blob/main/docs/agent.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/mcc/state.json
+
+[Service]
+User=mcc
+Group=mcc
+# /dev/kvm belongs to this group.
+SupplementaryGroups=kvm
+Environment=MCC_HOME=/var/lib/mcc
+ExecStart=/usr/local/bin/mcc run
+Restart=on-failure
+RestartSec=30
+# On stop only mcc is signalled: it shuts its VMs down and deletes them itself.
+KillMode=mixed
+TimeoutStopSec=120
+# No NoNewPrivileges or user-namespace restrictions here: sharing the job cache with a VM
+# uses newuidmap, which is setuid, and a user namespace.
+
+[Install]
+WantedBy=multi-user.target

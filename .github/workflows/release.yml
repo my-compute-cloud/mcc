@@ -1,8 +1,9 @@
 name: Release
 
-# Builds mcc, signs it with the Apple Developer ID, has Apple notarize it, and publishes it:
-# a GitHub release with checksums and build provenance, release.json for the Nix flake, and
-# the Homebrew formula in my-compute-cloud/homebrew-tap.
+# Builds mcc for Macs and for Linux hosts, signs the Mac binary with the Apple Developer ID,
+# has Apple notarize it, and publishes them: a GitHub release with checksums and build
+# provenance, release.json for the Nix flake, and the Homebrew formula in
+# my-compute-cloud/homebrew-tap. The Linux archives also hold the systemd unit.
 #
 # Nothing is published unless signing and notarization succeed.
 
@@ -55,6 +56,13 @@ jobs:
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath \
             -ldflags "-s -w -X github.com/my-compute-cloud/mcc/agent/internal/agent.Version=$VERSION" \
             -o ../dist/mcc ./cmd/mcc
+          for arch in amd64 arm64; do
+            mkdir -p "../dist/linux-$arch"
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X github.com/my-compute-cloud/mcc/agent/internal/agent.Version=$VERSION" \
+              -o "../dist/linux-$arch/mcc" ./cmd/mcc
+            cp packaging/mcc.service "../dist/linux-$arch/"
+          done
 
       - name: Sign
         env:
@@ -96,25 +104,38 @@ jobs:
         run: |
           [ "$(dist/mcc version)" = "$VERSION" ]
           tar -czf "dist/$ASSET" -C dist mcc
-          rm dist/mcc
-          (cd dist && shasum -a 256 "$ASSET" > checksums.txt && cat checksums.txt)
+          for arch in amd64 arm64; do
+            # macOS tar would otherwise record Apple's file attributes, which Linux tar warns about.
+            COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/mcc-linux-$arch.tar.gz" -C "dist/linux-$arch" mcc mcc.service
+          done
+          rm -rf dist/mcc dist/linux-amd64 dist/linux-arm64
+          (cd dist && shasum -a 256 mcc-*.tar.gz > checksums.txt && cat checksums.txt)
 
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/${{ env.ASSET }}
+          subject-path: dist/mcc-*.tar.gz
 
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v$VERSION" "dist/$ASSET" dist/checksums.txt \
+          gh release create "v$VERSION" dist/mcc-*.tar.gz dist/checksums.txt \
             --title "mcc $VERSION" --generate-notes --target "$GITHUB_SHA"
 
       - name: Record the release for the Nix flake
         run: |
-          sha=$(awk '{ print $1 }' dist/checksums.txt)
-          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$ASSET"
-          printf '{\n  "version": "%s",\n  "assets": {\n    "aarch64-darwin": { "url": "%s", "sha256": "%s" }\n  }\n}\n' "$VERSION" "$url" "$sha" > release.json
+          asset() {
+            sha=$(awk -v f="$2" '$2 == f { print $1 }' dist/checksums.txt)
+            [ -n "$sha" ] || { echo "::error::no checksum for $2"; exit 1; }
+            printf '    "%s": { "url": "https://github.com/%s/releases/download/v%s/%s", "sha256": "%s" }' \
+              "$1" "$GITHUB_REPOSITORY" "$VERSION" "$2" "$sha"
+          }
+          {
+            printf '{\n  "version": "%s",\n  "assets": {\n' "$VERSION"
+            asset aarch64-darwin "$ASSET"; printf ',\n'
+            asset x86_64-linux mcc-linux-amd64.tar.gz; printf ',\n'
+            asset aarch64-linux mcc-linux-arm64.tar.gz; printf '\n  }\n}\n'
+          } > release.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add release.json
@@ -126,7 +147,7 @@ jobs:
         env:
           TAP_DEPLOY_KEY_BASE64: ${{ secrets.TAP_DEPLOY_KEY_BASE64 }}
         run: |
-          sha=$(awk '{ print $1 }' dist/checksums.txt)
+          sha=$(awk -v f="$ASSET" '$2 == f { print $1 }' dist/checksums.txt)
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$ASSET"
           printf '%s' "$TAP_DEPLOY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/tap_key"
           chmod 600 "$RUNNER_TEMP/tap_key"

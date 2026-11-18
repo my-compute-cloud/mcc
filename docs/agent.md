@@ -1,8 +1,12 @@
 # Agent
 
 The agent (`mcc`) runs on the host. It opens one outbound WebSocket to the control plane,
-reports capacity, prepares images, and runs each assignment in a fresh Tart VM that it deletes
+reports capacity, prepares images, and runs each assignment in a fresh VM that it deletes
 afterwards. It never accepts inbound connections.
+
+A host is an Apple Silicon Mac, where the VMs are [Tart](https://tart.run)'s, or a Linux
+machine, where they are QEMU's with KVM. What follows is for Macs unless it says otherwise;
+[Linux hosts](#linux-hosts) has what differs.
 
 ## Install
 
@@ -28,12 +32,16 @@ ship it).
 
 - **Homebrew:** `brew install my-compute-cloud/tap/mcc`
 - **Install script:** `curl -fsSL https://mycompute.cloud/install.sh | sh`. It downloads the
-  latest release, checks it against the release's checksums and Apple's signature, and installs
-  it to `/usr/local/bin`.
+  latest release, checks it against the release's checksums and, on a Mac, Apple's signature,
+  and installs it to `/usr/local/bin`. On a Linux host it also leaves the systemd unit in
+  `/usr/local/share/mcc`; see [Linux hosts](#linux-hosts).
 - **From source:** `cd agent && go build -o mcc ./cmd/mcc`
 
-Release binaries are signed with an Apple Developer ID, notarized, and carry GitHub build
-provenance: `gh attestation verify mcc-darwin-arm64.tar.gz --repo my-compute-cloud/mcc`.
+Every release file carries GitHub build provenance:
+`gh attestation verify mcc-darwin-arm64.tar.gz --repo my-compute-cloud/mcc`. The Mac binary is
+also signed with an Apple Developer ID and notarized. The Linux ones
+(`mcc-linux-amd64.tar.gz`, `mcc-linux-arm64.tar.gz`) are static binaries with no signature of
+their own.
 
 ## Enroll
 
@@ -48,14 +56,16 @@ The token is single use and expires after 15 minutes. Enrollment generates an Ed
 the state directory; only the public key is sent. Every connection is authenticated by signing
 a fresh challenge. Revoking the host in the control plane deletes its public key.
 
-State lives in `~/Library/Application Support/mcc` (override with `MCC_HOME`):
+State lives in `~/Library/Application Support/mcc` on a Mac and in `~/.config/mcc` (or
+`$XDG_CONFIG_HOME/mcc`) on Linux; override with `MCC_HOME`:
 
 | File | Holds |
 |---|---|
 | `identity.key` | The private key, mode 0600 |
 | `state.json` | Server URL and host id |
 | `policy.json` | Local policy (optional; `MCC_POLICY_FILE` points elsewhere) |
-| `runner/` | Cached GitHub Actions runner, shared read-only into VMs |
+| `runner/`, `runner-linux/` | Cached GitHub Actions runner for macOS and for Linux guests, shared read-only into VMs |
+| `kvm/` | On a Linux host: image bases, the files of running VMs, and the runner as a disk image |
 
 ## Local policy
 
@@ -69,13 +79,13 @@ The control plane cannot override these. A `start` that breaks the policy is ans
 | `allowed_github_urls` | any | Repository or organization URLs a runner may register with; read from the just-in-time config |
 | `cpus`, `memory_mb` | an equal share | Per VM. By default the host divided by `max_vms`, and never more than half. |
 | `active_hours` | always | Local time window such as `22:00-07:00`; outside it the host reports no capacity |
-| `stay_awake` | true | Holds `caffeinate -i` while any VM runs |
-| `isolate_network` | true | Internet-only VM networking through Tart's Softnet, when available |
+| `stay_awake` | true | Holds `caffeinate -i` while any VM runs. Mac hosts only. |
+| `isolate_network` | true | Internet-only VM networking through Tart's Softnet, when available. Not available on Linux hosts yet. |
 | `require_network_isolation` | false | Refuse VMs rather than fall back to shared networking |
 | `shared_runner` | true | Keep a current Actions runner on the host and share it into each VM |
 | `image_refresh_hours` | 24 | Re-pull images this often; 0 disables |
 | `disk_gb` | the image's size | Disk size of each VM. A disk can grow but not shrink, so a value below the image's is ignored. The space is only used as a job fills it. |
-| `xcode` | none | Path of an Xcode.app on this host to copy into macOS images; see below |
+| `xcode` | none | Path of an Xcode.app on this host to copy into macOS images; see below. Mac hosts only. |
 | `preload_images` | none | Container images to pull into Linux images on this host; see below |
 | `cache_dir` | none | Host directory where jobs keep downloads between runs; see below |
 | `cache_scope` | `runner` | Who shares a cache: `runner` or `host` |
@@ -123,6 +133,108 @@ the agent pulls those into its copy of each Linux image once, when it prepares t
 again at every refresh so that the tags stay current. Jobs clone that copy, so their containers
 start without a pull. It needs Docker in the image. An image a workflow builds anew for each
 run cannot be preloaded; only its unchanged layers would help, and those are not shared yet.
+
+## Linux hosts
+
+On a Linux machine the agent starts Linux VMs with QEMU and KVM, for jobs of the machine's
+own architecture: x86_64 or arm64. Each job gets a fresh VM, as on a Mac. Containers are not
+used as the boundary between jobs.
+
+### What the host needs
+
+- Hardware virtualization, and the user that runs `mcc` in the `kvm` group (`/dev/kvm`).
+- QEMU for the host's architecture, `qemu-img`, `virtiofsd`, an SSH client, `mke2fs` and
+  `debugfs`, and `newuidmap`. On arm64 also the UEFI firmware. On Ubuntu 24.04:
+
+  ```bash
+  sudo apt-get install qemu-system-x86 qemu-utils virtiofsd openssh-client e2fsprogs uidmap
+  ```
+
+  with `qemu-system-arm qemu-efi-aarch64` in place of `qemu-system-x86` on arm64, and
+
+  ```bash
+  sudo usermod -aG kvm "$USER"
+  ```
+
+- No root. The agent, QEMU and `virtiofsd` all run as the user that runs `mcc`.
+
+`mcc run` logs what is missing when it starts.
+
+### As a service
+
+The release archives for Linux and the install script include a systemd unit,
+[`mcc.service`](../agent/packaging/mcc.service). It runs the agent as an unprivileged user
+`mcc` whose home, `/var/lib/mcc`, holds the key, state, images and job cache:
+
+```bash
+sudo useradd --system --create-home --home-dir /var/lib/mcc --shell /usr/sbin/nologin mcc
+```
+
+```bash
+sudo install -m 644 /usr/local/share/mcc/mcc.service /etc/systemd/system/mcc.service
+```
+
+```bash
+sudo -u mcc env MCC_HOME=/var/lib/mcc mcc enroll --server https://<control plane> <token>
+```
+
+```bash
+sudo systemctl enable --now mcc
+```
+
+The unit expects `mcc` in `/usr/local/bin` and does not start until the host is enrolled. It
+adds the `kvm` group itself, so the user needs no other setup. Logs are in
+`journalctl -u mcc`, and a `policy.json` goes in `/var/lib/mcc`. Stopping the service stops
+and deletes its VMs. There is no deb or NixOS module yet.
+
+### Images
+
+A Linux host cannot use an image made for Tart. Its images are OCI artifacts that hold a qcow2
+disk, built from the same configuration by the
+[images repository](https://github.com/my-compute-cloud/images) (`scripts/build-kvm.sh`, or
+`KVM_OUT` with `scripts/build.sh` on a Mac) and published with `scripts/push-kvm.sh`. A tag
+can cover both architectures; the host takes the disk for its own. Only images that can be
+pulled without a login are supported so far.
+
+A pool may hold both Mac and Linux hosts. Its image then names the Tart image as `source`
+and the KVM image under `host_sources.linux`, and the control plane sends each host the one
+for its system (see [operations](operations.md)). `allowed_images` is checked against the
+source the host is sent.
+
+A pool's image source may also be the full path of a directory on the host that holds
+`disk.qcow2` and `config.json`, which is what the build leaves: an image built on the host
+needs no registry.
+
+What an image must have: a user for jobs with `sudo` without a password, an SSH server, the
+`mcc-guest-access` service that the images repository installs (it lets in the key the host
+makes for each VM, and only that key), and Docker if jobs use `container:` or `services:`.
+
+### What differs from a Mac host
+
+| | Mac host | Linux host |
+|---|---|---|
+| Guests | macOS and Linux, arm64 | Linux, of the host's architecture |
+| Limit | Two macOS guests; Linux guests up to `max_vms` | `max_vms` |
+| `xcode` | Copies the host's Xcode into macOS images | Ignored |
+| `preload_images`, `cache_dir`, `disk_gb` | As described here | The same |
+| `stay_awake` | Holds off sleep | Does nothing |
+| Network isolation | Tart's Softnet, when set up | Not available yet: see below |
+
+A job's cache is shared through `virtiofsd`. What a job writes there belongs, on the host,
+to the user that runs `mcc`. In the VM it is the job's user's; a process running as some other
+user, as in some containers, may not be able to write to it. The runner reaches the VM as a
+read-only disk, not as a directory, so no job can change it for the next.
+
+**Network.** A VM reaches the internet through QEMU's user-mode network. It can also reach
+the host's local network and services that listen on the host's loopback address, such as a
+database you run for development. There is no setting that stops this yet, so
+`isolate_network` has no effect on a Linux host, and with `require_network_isolation` the
+host refuses jobs. Do not run jobs you do not trust on a Linux host whose local services
+trust their network.
+
+**Memory for shared caches.** With `cache_dir` set, a VM's memory is shared with `virtiofsd`.
+If the host has enough free huge pages reserved (`vm.nr_hugepages`), the agent uses them.
+That is optional on real hardware and required where the host is itself a VM.
 
 ## Job caches
 
@@ -172,3 +284,16 @@ shared networking unless `require_network_isolation` is set.
 4. When the runner exits, or the control plane sends `stop`, or the runner has not taken a job
    within the idle timeout, the VM is stopped and deleted, and only then is the final status sent.
 5. On start-up the agent deletes any `mcc-*` job VMs left from a crash.
+
+On a Linux host the steps are the same with other means:
+
+1. The image's disk is fetched once to `kvm/images/mcc-base-<hash>` (with a suffix when the
+   host adds container images to it). Each job gets a qcow2 overlay of it in
+   `kvm/vms/mcc-<assignment id>`, and a new SSH key.
+2. QEMU boots the overlay headless. The agent waits until the VM accepts the key, over a port
+   forwarded to the host's loopback address, then mounts the runner disk and the cache in the
+   guest under `/mnt/mcc`. A job's `PATH` and environment are those of a command run over SSH,
+   plus what `/etc/mcc/job-env` sets.
+3. The same entry command runs over SSH, with the configuration on stdin.
+4. The VM is ended and its directory deleted, and only then is the final status sent.
+5. On start-up the agent ends any QEMU left from a crash and deletes its directory.

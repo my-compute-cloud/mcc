@@ -35,20 +35,21 @@
           # Built from the source in this repository.
           agent-source = pkgs.callPackage ./nix/agent.nix { version = sourceVersion; };
 
-          # The signed, notarized binary from the GitHub release, where one exists for this system.
+          # The binary from the GitHub release, where one exists for this system. The Mac one is
+          # signed and notarized; the Linux ones are static.
           agent-signed = pkgs.stdenvNoCC.mkDerivation {
             pname = "mcc-agent";
             version = release.version;
             src = pkgs.fetchurl { inherit (asset) url sha256; };
             sourceRoot = ".";
             dontBuild = true;
-            # Any change to the file would break Apple's signature.
+            # Any change to the file would break Apple's signature, and the Linux binaries need none.
             dontFixup = true;
             installPhase = ''
               install -Dm755 mcc $out/bin/mcc
             '';
             meta = {
-              description = "My Compute Cloud agent (signed release binary)";
+              description = "My Compute Cloud agent (release binary)";
               homepage = "https://github.com/my-compute-cloud/mcc";
               mainProgram = "mcc";
               sourceProvenance = [ pkgs.lib.sourceTypes.binaryNativeCode ];

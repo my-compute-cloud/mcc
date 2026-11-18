@@ -138,19 +138,11 @@ func (t *Tart) installXcode(ctx context.Context, vm string) error {
 		return err
 	}
 	if code != 0 {
-		return fmt.Errorf("setting up Xcode in the VM failed: %s", lastLines(out.String(), 5))
+		return fmt.Errorf("setting up Xcode in the VM failed: %s", executor.LastLines(out.String(), 5))
 	}
 	if archived != nil {
-		return fmt.Errorf("reading %s: %v: %s", t.Xcode, archived, lastLines(archiveErr.String(), 3))
+		return fmt.Errorf("reading %s: %v: %s", t.Xcode, archived, executor.LastLines(archiveErr.String(), 3))
 	}
 	t.Log.Info("Xcode added", "xcode", x.version, "took", time.Since(started).Round(time.Second))
 	return nil
-}
-
-func lastLines(s string, n int) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return strings.Join(lines, " | ")
 }

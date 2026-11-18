@@ -344,7 +344,7 @@ func TestLinuxGuestsHaveTheirOwnEntryAndLimit(t *testing.T) {
 	if m := cp.next(status("l4", "failed")); !strings.Contains(m["reason"].(string), "no free slot") {
 		t.Fatalf("reason %v", m["reason"])
 	}
-	if !strings.Contains(f.Script("l1"), "mount -t virtiofs") || strings.Contains(f.Script("m1"), "mount -t virtiofs") {
+	if !strings.Contains(f.Script("l1"), executor.LinuxSharesDir) || strings.Contains(f.Script("m1"), executor.LinuxSharesDir) {
 		t.Fatal("guests were not given the entry command for their platform")
 	}
 }

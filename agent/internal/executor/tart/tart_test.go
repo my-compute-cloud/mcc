@@ -339,3 +339,37 @@ func TestContainerImagesArePulledIntoLinuxBases(t *testing.T) {
 		t.Errorf("refresh did not rebuild the base:\n%s", again)
 	}
 }
+
+func TestLinuxGuestSharesAreMountedBeforeTheJob(t *testing.T) {
+	tt, logf := stubTart(t)
+	ctx := context.Background()
+	img := protocol.ImageSpec{Name: "ubuntu", Source: "ghcr.io/my-compute-cloud/ubuntu-runner:24.04", Platform: "linux"}
+	if err := tt.Prepare(ctx, img); err != nil {
+		t.Fatal(err)
+	}
+	// The script has several lines, so the whole log is read rather than its calls.
+	mounted := func() bool {
+		b, _ := os.ReadFile(logf)
+		return strings.Contains(string(b), "exec mcc-shared /bin/bash -c") &&
+			strings.Contains(string(b), `sudo mount -t virtiofs com.apple.virtio-fs.automount "$D"`) &&
+			strings.Contains(string(b), `D="`+executor.LinuxSharesDir+`"`)
+	}
+	h, err := tt.Start(ctx, "bare", img, executor.StartOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tt.Stop(ctx, h)
+	if b, _ := os.ReadFile(logf); strings.Contains(string(b), "mount -t virtiofs") {
+		t.Fatal("a mount was attempted although nothing is shared")
+	}
+	h, err = tt.Start(ctx, "shared", img, executor.StartOptions{
+		SharedDirs: map[string]executor.SharedDir{"mcc-runner": {Path: "/runner/2.330.0"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tt.Stop(ctx, h)
+	if !mounted() {
+		t.Fatalf("the shares were not mounted in the Linux guest: %q", calls(t, logf))
+	}
+}

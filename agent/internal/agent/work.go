@@ -25,12 +25,10 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// runnerShare is the share name of the runner directory. macOS guests mount shares by
-// themselves at /Volumes/My Shared Files/<name>; Linux guests do not, so the entry command
-// mounts them at linuxShares/<name>.
+// runnerShare is the share name of the runner directory. macOS guests have shares at
+// /Volumes/My Shared Files/<name>, Linux guests at executor.LinuxSharesDir/<name>; how they
+// get there is the executor's business.
 const runnerShare = "mcc-runner"
-
-const linuxShares = "/mnt/mcc"
 
 // cacheShare is the share name of the job's cache directory, when the owner provides one.
 const cacheShare = "mcc-cache"
@@ -64,12 +62,7 @@ exec ./run.sh --jitconfig "$JIT"
 // githubRunnerScriptLinux is the same for Linux guests.
 const githubRunnerScriptLinux = `set -euo pipefail
 IFS= read -r JIT
-SHARES="` + linuxShares + `"
-if ! mountpoint -q "$SHARES"; then
-  sudo mkdir -p "$SHARES"
-  # Fails when the host shares nothing, which is fine.
-  sudo mount -t virtiofs com.apple.virtio-fs.automount "$SHARES" 2>/dev/null || true
-fi
+SHARES="` + executor.LinuxSharesDir + `"
 RUNNER="$HOME/actions-runner"
 if [ -x "$SHARES/` + runnerShare + `/run.sh" ]; then
   rm -rf "$RUNNER.mcc"
@@ -86,6 +79,10 @@ fi
 cd "$RUNNER"
 exec ./run.sh --jitconfig "$JIT"
 `
+
+// EntryScript is the fixed entry command of the github-runner workload for an image's guest
+// platform, for tests that run it in a real VM.
+func EntryScript(image protocol.ImageSpec) string { return entryScript(image) }
 
 // entryScript is the fixed entry command for an image's guest platform.
 func entryScript(image protocol.ImageSpec) string {

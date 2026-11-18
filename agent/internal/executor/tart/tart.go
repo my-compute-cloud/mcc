@@ -76,7 +76,7 @@ func BaseName(source string) string {
 func (t *Tart) base(ctx context.Context, image protocol.ImageSpec) (string, error) {
 	name := BaseName(image.Source)
 	if t.preloads(image) {
-		return name + "-" + t.preloadKey(), nil
+		return name + "-" + executor.PreloadKey(t.Preload), nil
 	}
 	if !t.addsXcode(image) {
 		return name, nil
@@ -359,7 +359,35 @@ func (t *Tart) Start(ctx context.Context, assignmentID string, image protocol.Im
 		_ = t.Stop(context.Background(), h)
 		return h, err
 	}
+	if image.Platform == "linux" && len(names) > 0 {
+		if err := t.mountShares(ctx, h); err != nil {
+			_ = t.Stop(context.Background(), h)
+			return h, err
+		}
+	}
 	return h, nil
+}
+
+// mountSharesScript mounts what the host shares in a Linux guest, which does not do so by
+// itself as a macOS guest does. Tart puts every share under one mount, each in a directory of
+// its name.
+const mountSharesScript = `set -e
+D="` + executor.LinuxSharesDir + `"
+mountpoint -q "$D" && exit 0
+sudo mkdir -p "$D"
+sudo mount -t virtiofs com.apple.virtio-fs.automount "$D"
+`
+
+func (t *Tart) mountShares(ctx context.Context, h executor.Handle) error {
+	var out bytes.Buffer
+	code, err := t.Exec(ctx, h, executor.Command{Script: mountSharesScript, Output: &out})
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("mounting the host's shared directories in the VM failed: %s", executor.LastLines(out.String(), 3))
+	}
+	return nil
 }
 
 func (t *Tart) Exec(ctx context.Context, h executor.Handle, c executor.Command) (int, error) {
@@ -409,6 +437,11 @@ func (t *Tart) List(ctx context.Context) ([]executor.Handle, error) {
 		}
 	}
 	return out, nil
+}
+
+// NetworkIsolationMissing says what the lack of isolation means on this host and how to get it.
+func (t *Tart) NetworkIsolationMissing() string {
+	return "Softnet is not set up, so VMs share the host's network. See docs/agent.md to enable Softnet."
 }
 
 // NetworkIsolationAvailable checks that Softnet can run without a password prompt: Tart needs

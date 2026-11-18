@@ -1,7 +1,7 @@
 // Command mcc is the My Compute Cloud agent.
 //
 //	mcc enroll --server URL [--name NAME] TOKEN   register this host with the control plane
-//	mcc run                                       connect and run work (normally as a launchd agent)
+//	mcc run                                       connect and run work (normally as a service)
 //	mcc policy                                    print the effective local policy
 //	mcc version
 package main
@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -29,6 +30,7 @@ import (
 	"github.com/my-compute-cloud/mcc/agent/internal/config"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/fake"
+	"github.com/my-compute-cloud/mcc/agent/internal/executor/kvm"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/tart"
 	"github.com/my-compute-cloud/mcc/agent/internal/identity"
 	"github.com/my-compute-cloud/mcc/agent/internal/runnerbin"
@@ -108,7 +110,7 @@ func enroll(args []string) error {
 	if err := config.SaveState(dir, config.State{ServerURL: *server, HostID: out.HostID, TenantID: out.TenantID}); err != nil {
 		return err
 	}
-	fmt.Printf("Enrolled as host %s. Start the agent with `mcc run` (or enable the launchd service).\n", out.HostID)
+	fmt.Printf("Enrolled as host %s. Start the agent with `mcc run` (or enable its service).\n", out.HostID)
 	return nil
 }
 
@@ -142,30 +144,31 @@ func run(args []string) error {
 		return err
 	}
 
-	var ex executor.Executor
-	switch os.Getenv("MCC_EXECUTOR") {
-	case "fake":
-		f := fake.New()
-		f.JobDuration = 200 * time.Millisecond
-		ex = f
-	case "", "tart":
-		t := tart.New(log)
-		t.Xcode = policy.Xcode
-		t.Preload = policy.PreloadImages
-		ex = t
-	default:
-		return fmt.Errorf("unknown MCC_EXECUTOR %q", os.Getenv("MCC_EXECUTOR"))
+	ex, err := newExecutor(dir, policy, log)
+	if err != nil {
+		return err
+	}
+	if k, ok := ex.(*kvm.KVM); ok {
+		for _, problem := range k.Preflight() {
+			log.Warn("this host is not ready to run VMs", "problem", problem)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// One Actions runner per guest platform: macOS and Linux guests each need their own build.
+	// One Actions runner per guest platform this host can run: macOS and Linux guests each
+	// need their own build.
 	var runners runnerSet
 	if policy.SharedRunnerEnabled() && os.Getenv("MCC_EXECUTOR") != "fake" {
-		runners = runnerSet{
-			"darwin": runnerbin.New(filepath.Join(dir, "runner"), "osx-"+runnerArch()),
-			"linux":  runnerbin.New(filepath.Join(dir, "runner-linux"), "linux-"+runnerArch()),
+		runners = runnerSet{}
+		for _, platform := range ex.GuestPlatforms() {
+			switch platform {
+			case "darwin":
+				runners[platform] = runnerbin.New(filepath.Join(dir, "runner"), "osx-"+runnerArch())
+			case "linux":
+				runners[platform] = runnerbin.New(filepath.Join(dir, "runner-linux"), "linux-"+runnerArch())
+			}
 		}
 		for platform, m := range runners {
 			go keepRunnerCurrent(ctx, platform, m, log)
@@ -192,6 +195,36 @@ func run(args []string) error {
 	})
 	log.Info("starting agent", "version", agent.Version, "host", state.HostID, "server", state.ServerURL)
 	return a.Run(ctx)
+}
+
+// newExecutor is how this host runs VMs: Tart on a Mac, QEMU with KVM on Linux. MCC_EXECUTOR
+// names another, which is for tests.
+func newExecutor(dir string, policy config.Policy, log *slog.Logger) (executor.Executor, error) {
+	name := os.Getenv("MCC_EXECUTOR")
+	if name == "" {
+		name = map[string]string{"darwin": "tart", "linux": "kvm"}[runtime.GOOS]
+	}
+	switch name {
+	case "fake":
+		f := fake.New()
+		f.JobDuration = 200 * time.Millisecond
+		return f, nil
+	case "tart":
+		t := tart.New(log)
+		t.Xcode = policy.Xcode
+		t.Preload = policy.PreloadImages
+		return t, nil
+	case "kvm":
+		if policy.Xcode != "" {
+			log.Warn("the xcode policy only applies to Mac hosts and is ignored")
+		}
+		k := kvm.New(filepath.Join(dir, "kvm"), log)
+		k.Preload = policy.PreloadImages
+		return k, nil
+	case "":
+		return nil, fmt.Errorf("mcc does not run VMs on %s", runtime.GOOS)
+	}
+	return nil, fmt.Errorf("unknown MCC_EXECUTOR %q", name)
 }
 
 // runnerSet holds the runner for each guest platform.
@@ -254,7 +287,7 @@ func resources(p config.Policy) executor.Resources {
 
 func hostMemoryMB() int {
 	if runtime.GOOS != "darwin" {
-		return 0
+		return kvm.HostMemoryMB()
 	}
 	out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
 	if err != nil {
@@ -276,6 +309,10 @@ func showPolicy() error {
 	if err != nil {
 		return err
 	}
+	ex, err := newExecutor(dir, p, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		return err
+	}
 	b, _ := json.MarshalIndent(struct {
 		config.Policy
 		File                  string             `json:"file"`
@@ -283,7 +320,7 @@ func showPolicy() error {
 		NetworkIsolationOn    bool               `json:"network_isolation_effective"`
 		StayAwakeEffective    bool               `json:"stay_awake_effective"`
 		SharedRunnerEffective bool               `json:"shared_runner_effective"`
-	}{p, config.PolicyPath(dir), resources(p), p.NetworkIsolation() && tart.New(slog.Default()).NetworkIsolationAvailable(), p.StayAwakeEnabled(), p.SharedRunnerEnabled()}, "", "  ")
+	}{p, config.PolicyPath(dir), resources(p), p.NetworkIsolation() && ex.NetworkIsolationAvailable(), p.StayAwakeEnabled(), p.SharedRunnerEnabled()}, "", "  ")
 	fmt.Println(string(b))
 	return nil
 }
