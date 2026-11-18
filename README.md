@@ -27,6 +27,9 @@ planned.
 
 ## Install
 
+> The first signed release is being prepared. Until it is published, the commands below will
+> not find anything to install; build from source instead.
+
 Homebrew:
 
 ```bash
