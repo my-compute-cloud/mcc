@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mcc.dev/protocol/schema.json",
+  "title": "MCC agent protocol",
+  "description": "Messages exchanged over the agent WebSocket. Every message carries type, v (protocol version) and id. Generated types: protocol/gen/messages.ts and agent/internal/protocol/messages.go (run `bun run protocol:gen`).",
+  "x-protocol-versions": [1],
+  "x-directions": {
+    "agent": ["hello", "capacity", "status", "heartbeat"],
+    "server": ["challenge", "welcome", "reject", "start", "stop", "config"]
+  },
+  "$defs": {
+    "Platform": {
+      "type": "object",
+      "description": "Host operating system and CPU architecture.",
+      "properties": {
+        "os": { "type": "string", "description": "darwin, linux or windows" },
+        "arch": { "type": "string", "description": "arm64 or amd64" }
+      },
+      "required": ["os", "arch"]
+    },
+    "AgentAssignmentState": {
+      "type": "string",
+      "description": "Assignment states an agent reports. The control plane maps running to idle or busy.",
+      "enum": ["starting", "running", "finished", "failed"]
+    },
+    "AssignmentReport": {
+      "type": "object",
+      "description": "One assignment the agent currently knows about.",
+      "properties": {
+        "assignment_id": { "type": "string" },
+        "state": { "$ref": "#/$defs/AgentAssignmentState" },
+        "reason": { "type": "string" }
+      },
+      "required": ["assignment_id", "state"]
+    },
+    "ImageSpec": {
+      "type": "object",
+      "description": "An image the agent may prepare and run.",
+      "properties": {
+        "name": { "type": "string", "description": "Stable image name within the tenant" },
+        "source": { "type": "string", "description": "OCI reference, for example ghcr.io/cirruslabs/macos-sequoia-xcode:latest" },
+        "platform": { "type": "string", "description": "Guest OS: darwin or linux" }
+      },
+      "required": ["name", "source", "platform"]
+    },
+    "PoolConfig": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "label": { "type": "string" },
+        "image": { "type": "string", "description": "ImageSpec.name" }
+      },
+      "required": ["name", "label", "image"]
+    },
+    "Workload": {
+      "type": "object",
+      "description": "What to run inside the VM. The agent maps kind to a fixed entry command; there is no free-form command.",
+      "properties": {
+        "kind": { "type": "string", "enum": ["github-runner"] },
+        "runner_name": { "type": "string" },
+        "jit_config": { "type": "string", "description": "GitHub just-in-time runner configuration, single use" },
+        "idle_timeout_seconds": { "type": "integer", "description": "Stop the VM if the runner has not taken a job by then" }
+      },
+      "required": ["kind", "runner_name", "jit_config"]
+    },
+
+    "Hello": {
+      "type": "object",
+      "x-message": "hello",
+      "description": "First message from the agent, answering challenge.",
+      "properties": {
+        "host_id": { "type": "string" },
+        "agent_version": { "type": "string" },
+        "versions": { "type": "array", "items": { "type": "integer" }, "description": "Protocol versions the agent speaks" },
+        "platform": { "$ref": "#/$defs/Platform" },
+        "signature": { "type": "string", "description": "base64 Ed25519 signature over \"mcc-hello\\n\" + nonce + \"\\n\" + host_id" },
+        "assignments": { "type": "array", "items": { "$ref": "#/$defs/AssignmentReport" } }
+      },
+      "required": ["host_id", "agent_version", "versions", "platform", "signature", "assignments"]
+    },
+    "Capacity": {
+      "type": "object",
+      "x-message": "capacity",
+      "properties": {
+        "slots_total": { "type": "integer" },
+        "slots_free": { "type": "integer" },
+        "images_ready": { "type": "array", "items": { "type": "string" }, "description": "ImageSpec.name values ready locally" },
+        "accepting": { "type": "boolean", "description": "False outside active hours or while draining" }
+      },
+      "required": ["slots_total", "slots_free", "images_ready", "accepting"]
+    },
+    "Status": {
+      "type": "object",
+      "x-message": "status",
+      "properties": {
+        "assignment_id": { "type": "string" },
+        "state": { "$ref": "#/$defs/AgentAssignmentState" },
+        "reason": { "type": "string" }
+      },
+      "required": ["assignment_id", "state"]
+    },
+    "Heartbeat": {
+      "type": "object",
+      "x-message": "heartbeat",
+      "properties": {}
+    },
+
+    "Challenge": {
+      "type": "object",
+      "x-message": "challenge",
+      "description": "Sent by the control plane as soon as the socket opens.",
+      "properties": {
+        "nonce": { "type": "string" },
+        "versions": { "type": "array", "items": { "type": "integer" } }
+      },
+      "required": ["nonce", "versions"]
+    },
+    "Welcome": {
+      "type": "object",
+      "x-message": "welcome",
+      "properties": {
+        "version": { "type": "integer", "description": "Protocol version chosen for this connection" },
+        "tenant_id": { "type": "string" },
+        "pools": { "type": "array", "items": { "$ref": "#/$defs/PoolConfig" } },
+        "images": { "type": "array", "items": { "$ref": "#/$defs/ImageSpec" } },
+        "heartbeat_interval_seconds": { "type": "integer" }
+      },
+      "required": ["version", "tenant_id", "pools", "images", "heartbeat_interval_seconds"]
+    },
+    "Reject": {
+      "type": "object",
+      "x-message": "reject",
+      "properties": {
+        "reason": { "type": "string" },
+        "upgrade_required": { "type": "boolean" }
+      },
+      "required": ["reason", "upgrade_required"]
+    },
+    "Start": {
+      "type": "object",
+      "x-message": "start",
+      "properties": {
+        "assignment_id": { "type": "string" },
+        "image": { "$ref": "#/$defs/ImageSpec" },
+        "workload": { "$ref": "#/$defs/Workload" }
+      },
+      "required": ["assignment_id", "image", "workload"]
+    },
+    "Stop": {
+      "type": "object",
+      "x-message": "stop",
+      "properties": {
+        "assignment_id": { "type": "string" },
+        "reason": { "type": "string" }
+      },
+      "required": ["assignment_id"]
+    },
+    "Config": {
+      "type": "object",
+      "x-message": "config",
+      "properties": {
+        "pools": { "type": "array", "items": { "$ref": "#/$defs/PoolConfig" } },
+        "images": { "type": "array", "items": { "$ref": "#/$defs/ImageSpec" } }
+      },
+      "required": ["pools", "images"]
+    }
+  }
+}

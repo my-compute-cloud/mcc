@@ -1,0 +1,170 @@
+name: Release
+
+# Builds mcc, signs it with the Apple Developer ID, has Apple notarize it, and publishes it:
+# a GitHub release with checksums and build provenance, release.json for the Nix flake, and
+# the Homebrew formula in my-compute-cloud/homebrew-tap.
+#
+# Nothing is published unless signing and notarization succeed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the leading v (for example 0.2.0)
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      ASSET: mcc-darwin-arm64.tar.gz
+    steps:
+      - name: Check the version
+        run: |
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::version must look like 1.2.3"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - name: Refuse to release a version twice
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then echo "::error::v$VERSION already exists"; exit 1; fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+
+      - name: Test
+        working-directory: agent
+        run: go test ./...
+
+      - name: Build
+        working-directory: agent
+        run: |
+          mkdir -p ../dist
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath \
+            -ldflags "-s -w -X github.com/my-compute-cloud/mcc/agent/internal/agent.Version=$VERSION" \
+            -o ../dist/mcc ./cmd/mcc
+
+      - name: Sign
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          [ -n "$APPLE_CERTIFICATE_P12_BASE64" ] || { echo "::error::the signing certificate is not configured"; exit 1; }
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -hex 24)
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')
+          [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in the certificate"; exit 1; }
+          codesign --force --options runtime --timestamp --identifier cloud.mycompute.mcc --sign "$identity" dist/mcc
+          codesign --verify --strict --verbose=2 dist/mcc
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ditto -c -k dist/mcc dist/mcc.zip
+          xcrun notarytool submit dist/mcc.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait | tee notary.log
+          grep -q "status: Accepted" notary.log || { echo "::error::Apple did not accept the binary"; exit 1; }
+          rm dist/mcc.zip
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+      - name: Package
+        run: |
+          [ "$(dist/mcc version)" = "$VERSION" ]
+          tar -czf "dist/$ASSET" -C dist mcc
+          rm dist/mcc
+          (cd dist && shasum -a 256 "$ASSET" > checksums.txt && cat checksums.txt)
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/${{ env.ASSET }}
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" "dist/$ASSET" dist/checksums.txt \
+            --title "mcc $VERSION" --generate-notes --target "$GITHUB_SHA"
+
+      - name: Record the release for the Nix flake
+        run: |
+          sha=$(awk '{ print $1 }' dist/checksums.txt)
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$ASSET"
+          printf '{\n  "version": "%s",\n  "assets": {\n    "aarch64-darwin": { "url": "%s", "sha256": "%s" }\n  }\n}\n' "$VERSION" "$url" "$sha" > release.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add release.json
+          git commit -m "Release $VERSION"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Update the Homebrew formula
+        env:
+          TAP_DEPLOY_KEY_BASE64: ${{ secrets.TAP_DEPLOY_KEY_BASE64 }}
+        run: |
+          sha=$(awk '{ print $1 }' dist/checksums.txt)
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$ASSET"
+          printf '%s' "$TAP_DEPLOY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/tap_key"
+          chmod 600 "$RUNNER_TEMP/tap_key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/tap_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 git@github.com:my-compute-cloud/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/mcc.rb <<EOF
+          class Mcc < Formula
+            desc "My Compute Cloud agent: runs GitHub Actions jobs in throwaway VMs on your own machine"
+            homepage "https://mycompute.cloud"
+            url "$url"
+            version "$VERSION"
+            sha256 "$sha"
+            license :cannot_represent
+
+            depends_on arch: :arm64
+            depends_on :macos
+
+            def install
+              bin.install "mcc"
+            end
+
+            def caveats
+              <<~EOS
+                mcc runs jobs with Tart, which is installed separately: https://tart.run
+                Add this host from https://mycompute.cloud/dashboard
+              EOS
+            end
+
+            test do
+              assert_equal version.to_s, shell_output("#{bin}/mcc version").strip
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/mcc.rb
+          git commit -m "mcc $VERSION"
+          git push origin HEAD
+          rm -f "$RUNNER_TEMP/tap_key"
