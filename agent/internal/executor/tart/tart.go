@@ -4,6 +4,10 @@
 // Images are OCI images. Each is cloned once to a local base VM ("mcc-base-<hash>"); each job VM
 // ("mcc-<assignment>") is a copy-on-write clone of that base, deleted when the job ends. Commands
 // run through the Tart guest agent (`tart exec`), so no SSH credentials are needed.
+//
+// The owner can have the host add to a base before jobs clone it: its own Xcode for macOS
+// images (xcode.go), so jobs get Xcode without anyone distributing an image that contains it,
+// and container images for Linux images (preload.go), so jobs start containers without pulling.
 package tart
 
 import (
@@ -39,10 +43,16 @@ type Tart struct {
 	Log *slog.Logger
 	// BootTimeout bounds waiting for the guest agent after boot.
 	BootTimeout time.Duration
+	// Xcode is the host's Xcode.app to copy into every macOS base, or "" for none.
+	Xcode string
+	// Preload lists container images to pull into every Linux base.
+	Preload []string
 
 	mu      sync.Mutex
 	running map[string]*exec.Cmd // VM name -> `tart run` process
 	prepMu  sync.Mutex           // serialises image pulls
+	built   map[string]string    // base name -> the image digest it was built from
+	xcode   xcodeInfo            // the host Xcode's version, read at most once a minute
 }
 
 func New(log *slog.Logger) *Tart {
@@ -50,13 +60,33 @@ func New(log *slog.Logger) *Tart {
 	if err != nil {
 		bin = "tart"
 	}
-	return &Tart{Bin: bin, Log: log, BootTimeout: 5 * time.Minute, running: map[string]*exec.Cmd{}}
+	return &Tart{Bin: bin, Log: log, BootTimeout: 5 * time.Minute, running: map[string]*exec.Cmd{}, built: map[string]string{}}
 }
 
-// BaseName is the local VM an image is cloned to before jobs clone from it.
+// BaseName is the local VM an image is cloned to before jobs clone from it, when nothing is
+// added to the image on this host.
 func BaseName(source string) string {
 	h := sha256.Sum256([]byte(source))
 	return basePrefix + hex.EncodeToString(h[:])[:12]
+}
+
+// base is the local VM jobs clone from. Its name also covers what this host adds to the image,
+// so that a change to that (another Xcode, or none) makes a new base rather than reusing one
+// with the wrong contents.
+func (t *Tart) base(ctx context.Context, image protocol.ImageSpec) (string, error) {
+	name := BaseName(image.Source)
+	if t.preloads(image) {
+		return name + "-" + t.preloadKey(), nil
+	}
+	if !t.addsXcode(image) {
+		return name, nil
+	}
+	x, err := t.hostXcode(ctx)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256([]byte(t.Xcode + "\n" + x.build))
+	return name + "-x" + hex.EncodeToString(h[:])[:8], nil
 }
 
 // VMName is the job VM for an assignment.
@@ -106,22 +136,25 @@ func (t *Tart) exists(ctx context.Context, name string) bool {
 }
 
 func (t *Tart) Ready(ctx context.Context, image protocol.ImageSpec) bool {
-	return t.exists(ctx, BaseName(image.Source))
+	base, err := t.base(ctx, image)
+	return err == nil && t.exists(ctx, base)
 }
 
 func (t *Tart) Prepare(ctx context.Context, image protocol.ImageSpec) error {
 	t.prepMu.Lock()
 	defer t.prepMu.Unlock()
-	base := BaseName(image.Source)
+	base, err := t.base(ctx, image)
+	if err != nil {
+		return err
+	}
 	if t.exists(ctx, base) {
 		return nil
 	}
 	t.Log.Info("preparing image", "image", image.Name, "source", image.Source)
-	if _, err := t.run(ctx, "pull", image.Source); err != nil {
+	if err := t.pull(ctx, image.Source); err != nil {
 		return err
 	}
-	_, err := t.run(ctx, "clone", image.Source, base)
-	return err
+	return t.build(ctx, image, base)
 }
 
 // Refresh pulls the image again and, if the tag now points somewhere new, replaces the base.
@@ -129,27 +162,159 @@ func (t *Tart) Prepare(ctx context.Context, image protocol.ImageSpec) error {
 func (t *Tart) Refresh(ctx context.Context, image protocol.ImageSpec) error {
 	t.prepMu.Lock()
 	defer t.prepMu.Unlock()
-	if _, err := t.run(ctx, "pull", image.Source); err != nil {
+	base, err := t.base(ctx, image)
+	if err != nil {
 		return err
 	}
-	base := BaseName(image.Source)
+	if err := t.pull(ctx, image.Source); err != nil {
+		return err
+	}
+	// Preloaded container images are tags too, and may have moved although the image has not.
+	if d := t.digest(ctx, image.Source); d != "" && d == t.built[base] && t.exists(ctx, base) && !t.preloads(image) {
+		return nil
+	}
+	return t.build(ctx, image, base)
+}
+
+// pull fetches an image from its registry. A source that names a VM already on this host, such
+// as one the owner built here, is used as it is.
+func (t *Tart) pull(ctx context.Context, source string) error {
+	if t.exists(ctx, source) {
+		return nil
+	}
+	_, err := t.run(ctx, "pull", source)
+	return err
+}
+
+// digest is the exact image a source refers to at the moment, or "" when Tart cannot say.
+func (t *Tart) digest(ctx context.Context, source string) string {
+	out, err := t.run(ctx, "fqn", source)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// build makes the base from the pulled image: a clone, plus whatever this host adds. It is put
+// together under another name and swapped in whole, so a failure leaves the old base in place.
+func (t *Tart) build(ctx context.Context, image protocol.ImageSpec, base string) error {
 	next := base + "-next"
 	_, _ = t.run(ctx, "delete", next)
 	if _, err := t.run(ctx, "clone", image.Source, next); err != nil {
 		return err
+	}
+	if t.addsXcode(image) {
+		if err := t.installXcode(ctx, next); err != nil {
+			_, _ = t.run(context.WithoutCancel(ctx), "delete", next)
+			return fmt.Errorf("adding Xcode to %s: %w", image.Name, err)
+		}
+	}
+	if t.preloads(image) {
+		if err := t.preloadImages(ctx, next); err != nil {
+			_, _ = t.run(context.WithoutCancel(ctx), "delete", next)
+			return fmt.Errorf("adding container images to %s: %w", image.Name, err)
+		}
 	}
 	if t.exists(ctx, base) {
 		if _, err := t.run(ctx, "delete", base); err != nil {
 			return err
 		}
 	}
-	_, err := t.run(ctx, "rename", next, base)
-	return err
+	if _, err := t.run(ctx, "rename", next, base); err != nil {
+		return err
+	}
+	t.built[base] = t.digest(ctx, image.Source)
+	t.pruneBases(ctx, image.Source, base)
+	return nil
+}
+
+// pruneBases deletes this image's other bases: ones made before the owner changed what the
+// host adds to it. Each is tens of gigabytes.
+func (t *Tart) pruneBases(ctx context.Context, source, keep string) {
+	vms, err := t.list(ctx)
+	if err != nil {
+		return
+	}
+	prefix := BaseName(source)
+	for _, v := range vms {
+		if v.Name != keep && (v.Name == prefix || strings.HasPrefix(v.Name, prefix+"-")) {
+			if _, err := t.run(ctx, "delete", v.Name); err != nil {
+				t.Log.Warn("deleting an outdated base failed", "vm", v.Name, "err", err)
+			}
+		}
+	}
+}
+
+// diskGB is a VM's disk size, or 0 when Tart does not report one.
+func (t *Tart) diskGB(ctx context.Context, name string) int {
+	out, err := t.run(ctx, "get", name, "--format", "json")
+	if err != nil {
+		return 0
+	}
+	var info struct {
+		Disk int `json:"Disk"`
+	}
+	_ = json.Unmarshal([]byte(out), &info)
+	return info.Disk
+}
+
+// boot starts a VM and waits for its guest agent. The VM is not tied to ctx: it lives until
+// halted, whatever happens to the caller.
+func (t *Tart) boot(ctx context.Context, name string, args ...string) error {
+	cmd := exec.Command(t.Bin, append([]string{"run", name, "--no-graphics"}, args...)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("tart run: %w", err)
+	}
+	t.mu.Lock()
+	t.running[name] = cmd
+	t.mu.Unlock()
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+
+	deadline := time.Now().Add(t.BootTimeout)
+	for {
+		probe, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := t.run(probe, "exec", name, "true")
+		cancel()
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-exited:
+			return fmt.Errorf("vm exited during boot: %s", strings.TrimSpace(stderr.String()))
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+		if time.Now().After(deadline) {
+			return errors.New("guest agent did not respond; does the image include the Tart guest agent?")
+		}
+	}
+}
+
+// halt shuts a VM down, giving the guest the given seconds to do it cleanly.
+func (t *Tart) halt(ctx context.Context, name string, seconds int) {
+	_, _ = t.run(ctx, "stop", name, "--timeout", fmt.Sprint(seconds))
+	t.mu.Lock()
+	cmd := t.running[name]
+	delete(t.running, name)
+	t.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 }
 
 func (t *Tart) Start(ctx context.Context, assignmentID string, image protocol.ImageSpec, opts executor.StartOptions) (executor.Handle, error) {
 	h := executor.Handle{AssignmentID: assignmentID, Name: VMName(assignmentID)}
-	base := BaseName(image.Source)
+	base, err := t.base(ctx, image)
+	if err != nil {
+		return h, err
+	}
 	if !t.exists(ctx, base) {
 		return h, fmt.Errorf("image %s is not prepared", image.Name)
 	}
@@ -163,6 +328,10 @@ func (t *Tart) Start(ctx context.Context, assignmentID string, image protocol.Im
 	if opts.Resources.MemoryMB > 0 {
 		set = append(set, "--memory", fmt.Sprint(opts.Resources.MemoryMB))
 	}
+	// The guest grows its volume to fill the disk when it boots. Tart refuses to shrink one.
+	if want := opts.Resources.DiskGB; want > 0 && want > t.diskGB(ctx, h.Name) {
+		set = append(set, "--disk-size", fmt.Sprint(want))
+	}
 	// A fresh MAC avoids DHCP lease clashes between clones of one base.
 	set = append(set, "--random-mac")
 	if _, err := t.run(ctx, set...); err != nil {
@@ -170,7 +339,7 @@ func (t *Tart) Start(ctx context.Context, assignmentID string, image protocol.Im
 		return h, err
 	}
 
-	args := []string{"run", h.Name, "--no-graphics"}
+	var args []string
 	if opts.IsolateNetwork {
 		args = append(args, "--net-softnet")
 	}
@@ -180,47 +349,17 @@ func (t *Tart) Start(ctx context.Context, assignmentID string, image protocol.Im
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		args = append(args, fmt.Sprintf("--dir=%s:%s:ro", n, opts.SharedDirs[n]))
+		dir := fmt.Sprintf("--dir=%s:%s", n, opts.SharedDirs[n].Path)
+		if !opts.SharedDirs[n].Writable {
+			dir += ":ro"
+		}
+		args = append(args, dir)
 	}
-	// Not tied to ctx: the VM lives until Stop, whatever happens to the caller.
-	cmd := exec.Command(t.Bin, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	if err := t.boot(ctx, h.Name, args...); err != nil {
 		_ = t.Stop(context.Background(), h)
-		return h, fmt.Errorf("tart run: %w", err)
+		return h, err
 	}
-	t.mu.Lock()
-	t.running[h.Name] = cmd
-	t.mu.Unlock()
-	exited := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(exited)
-	}()
-
-	deadline := time.Now().Add(t.BootTimeout)
-	for {
-		probe, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := t.run(probe, "exec", h.Name, "true")
-		cancel()
-		if err == nil {
-			return h, nil
-		}
-		select {
-		case <-exited:
-			_ = t.Stop(context.Background(), h)
-			return h, fmt.Errorf("vm exited during boot: %s", strings.TrimSpace(stderr.String()))
-		case <-ctx.Done():
-			_ = t.Stop(context.Background(), h)
-			return h, ctx.Err()
-		case <-time.After(2 * time.Second):
-		}
-		if time.Now().After(deadline) {
-			_ = t.Stop(context.Background(), h)
-			return h, errors.New("guest agent did not respond; does the image include the Tart guest agent?")
-		}
-	}
+	return h, nil
 }
 
 func (t *Tart) Exec(ctx context.Context, h executor.Handle, c executor.Command) (int, error) {
@@ -250,14 +389,7 @@ func (t *Tart) Exec(ctx context.Context, h executor.Handle, c executor.Command) 
 }
 
 func (t *Tart) Stop(ctx context.Context, h executor.Handle) error {
-	_, _ = t.run(ctx, "stop", h.Name, "--timeout", "15")
-	t.mu.Lock()
-	cmd := t.running[h.Name]
-	delete(t.running, h.Name)
-	t.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	t.halt(ctx, h.Name, 15)
 	if !t.exists(ctx, h.Name) {
 		return nil
 	}
@@ -294,6 +426,9 @@ func (t *Tart) NetworkIsolationAvailable() bool {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	return ok && st.Uid == 0 && info.Mode()&os.ModeSetuid != 0
 }
+
+// GuestPlatforms: Tart runs macOS and Linux guests on Apple Silicon.
+func (t *Tart) GuestPlatforms() []string { return []string{"darwin", "linux"} }
 
 // MaxVMs: Apple's licence and the Virtualization framework allow two macOS guests per host.
 func (t *Tart) MaxVMs(image protocol.ImageSpec) int {

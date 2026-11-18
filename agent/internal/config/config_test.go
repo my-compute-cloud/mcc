@@ -81,3 +81,26 @@ func TestState(t *testing.T) {
 		t.Fatalf("%+v %v", s, err)
 	}
 }
+
+func TestDiskXcodeAndCachePolicy(t *testing.T) {
+	ok := Policy{DiskGB: 120, Xcode: "/Applications/Xcode.app", CacheDir: "/Users/me/mcc-cache", CacheScope: "host", CacheMaxGB: 50,
+		PreloadImages: []string{"mysql:8.4", "ghcr.io/acme/app@sha256:0123abcd", "localhost:5000/x/y:1"}}
+	if err := ok.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, bad := range map[string]Policy{
+		"negative disk":           {DiskGB: -1},
+		"relative Xcode":          {Xcode: "Xcode.app"},
+		"Xcode not an app":        {Xcode: "/Applications/Xcode"},
+		"relative cache":          {CacheDir: "cache"},
+		"unknown cache scope":     {CacheScope: "repository"},
+		"negative cache size":     {CacheMaxGB: -5},
+		"image that is an option": {PreloadImages: []string{"--privileged"}},
+		"image with a space":      {PreloadImages: []string{"mysql:8.4 redis:8"}},
+		"empty image":             {PreloadImages: []string{""}},
+	} {
+		if err := bad.Validate(); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}

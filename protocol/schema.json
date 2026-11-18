@@ -85,9 +85,23 @@
         "slots_total": { "type": "integer" },
         "slots_free": { "type": "integer" },
         "images_ready": { "type": "array", "items": { "type": "string" }, "description": "ImageSpec.name values ready locally" },
-        "accepting": { "type": "boolean", "description": "False outside active hours or while draining" }
+        "accepting": { "type": "boolean", "description": "False outside active hours or while draining" },
+        "guests": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/GuestCapacity" },
+          "description": "Guest platforms this host can run. Absent from agents that only run macOS guests"
+        }
       },
       "required": ["slots_total", "slots_free", "images_ready", "accepting"]
+    },
+    "GuestCapacity": {
+      "type": "object",
+      "description": "One guest platform a host can run, and its own limit within the host's slots.",
+      "properties": {
+        "platform": { "type": "string", "description": "ImageSpec.platform: darwin or linux" },
+        "limit": { "type": "integer", "description": "Most VMs of this platform at once; 0 means only slots_total limits them" }
+      },
+      "required": ["platform", "limit"]
     },
     "Status": {
       "type": "object",

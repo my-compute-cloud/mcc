@@ -19,6 +19,16 @@ type Handle struct {
 type Resources struct {
 	CPUs     int
 	MemoryMB int
+	// DiskGB grows the machine's disk to this size. Zero, or a size below the image's, leaves
+	// the image's size: a disk can grow but not shrink.
+	DiskGB int
+}
+
+// SharedDir is a host directory mounted in the guest.
+type SharedDir struct {
+	Path string
+	// Writable lets the guest change the directory. Everything else is mounted read-only.
+	Writable bool
 }
 
 // Options that apply to starting a machine.
@@ -26,8 +36,8 @@ type StartOptions struct {
 	Resources Resources
 	// IsolateNetwork asks for internet-only networking.
 	IsolateNetwork bool
-	// SharedDirs maps a share name to a host directory mounted read-only in the guest.
-	SharedDirs map[string]string
+	// SharedDirs maps a share name to a host directory mounted in the guest.
+	SharedDirs map[string]SharedDir
 }
 
 // Command is the workload's entry command. Agents build it from a fixed template per workload
@@ -59,4 +69,6 @@ type Executor interface {
 	NetworkIsolationAvailable() bool
 	// MaxVMs is the platform's own limit on concurrent machines (0 for none).
 	MaxVMs(image protocol.ImageSpec) int
+	// GuestPlatforms are the ImageSpec platforms this executor can run on this host.
+	GuestPlatforms() []string
 }

@@ -6,6 +6,8 @@
 //	state.json    server URL and host id, written by `mcc enroll`
 //	policy.json   local policy, edited only by the host owner
 //	runner/       cached GitHub Actions runner, shared read-only into VMs
+//
+// Job caches (policy cache_dir) live wherever the owner puts them, not here.
 package config
 
 import (
@@ -15,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -102,6 +105,23 @@ type Policy struct {
 	SharedRunner *bool `json:"shared_runner"`
 	// ImageRefreshHours re-pulls images this often. Zero disables refresh.
 	ImageRefreshHours int `json:"image_refresh_hours"`
+	// DiskGB is each VM's disk size. Zero, or less than the image's, keeps the image's size.
+	DiskGB int `json:"disk_gb"`
+	// Xcode is the path of an Xcode.app on this host to copy into macOS images, so that jobs
+	// have Xcode although the image was published without it. Empty copies nothing.
+	Xcode string `json:"xcode"`
+	// PreloadImages are container images to pull into Linux images on this host, so that jobs
+	// start their containers and services without pulling them: for example "mysql:8.4".
+	PreloadImages []string `json:"preload_images"`
+	// CacheDir is a host directory where jobs keep downloads between runs. Empty gives jobs
+	// no cache: nothing a job writes then outlives it.
+	CacheDir string `json:"cache_dir"`
+	// CacheScope is who shares a cache: "runner" (the default) gives each repository or
+	// organization that runners register with its own; "host" gives every job the same one.
+	CacheScope string `json:"cache_scope"`
+	// CacheMaxGB is the size above which the least recently used caches are deleted. Zero
+	// means no limit.
+	CacheMaxGB int `json:"cache_max_gb"`
 }
 
 func boolOr(p *bool, d bool) bool {
@@ -159,8 +179,29 @@ func (p Policy) Validate() error {
 			return fmt.Errorf("policy: allowed_images %q: %w", g, err)
 		}
 	}
+	if p.DiskGB < 0 || p.CacheMaxGB < 0 {
+		return fmt.Errorf("policy: disk_gb and cache_max_gb must not be negative")
+	}
+	if p.Xcode != "" && (!filepath.IsAbs(p.Xcode) || !strings.HasSuffix(strings.TrimSuffix(p.Xcode, "/"), ".app")) {
+		return fmt.Errorf("policy: xcode must be the full path of an Xcode.app")
+	}
+	for _, ref := range p.PreloadImages {
+		if !containerImage.MatchString(ref) {
+			return fmt.Errorf("policy: preload_images %q is not a container image reference", ref)
+		}
+	}
+	if p.CacheDir != "" && !filepath.IsAbs(p.CacheDir) {
+		return fmt.Errorf("policy: cache_dir must be a full path")
+	}
+	if p.CacheScope != "" && p.CacheScope != "runner" && p.CacheScope != "host" {
+		return fmt.Errorf("policy: cache_scope must be runner or host")
+	}
 	return nil
 }
+
+// containerImage is the shape of a container image reference: registry, path, tag or digest.
+// It starts with a letter or digit, so a reference can never be read as an option.
+var containerImage = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
 
 // ImageAllowed reports whether policy permits an image source.
 func (p Policy) ImageAllowed(source string) bool {

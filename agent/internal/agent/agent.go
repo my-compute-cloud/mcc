@@ -30,9 +30,17 @@ import (
 // Version is set at build time with -ldflags.
 var Version = "dev"
 
-// RunnerSource supplies the host directory holding a current Actions runner ("" if none).
+// CacheSource hands out the host directory a job may keep downloads in. The directory depends
+// on which repository or organization the job's runner registers with.
+type CacheSource interface {
+	Acquire(githubURL string) (dir string, release func(), err error)
+	Prune()
+}
+
+// RunnerSource supplies the host directory holding a current Actions runner for a guest
+// platform (ImageSpec.Platform), or "" if there is none.
 type RunnerSource interface {
-	Current() string
+	Current(platform string) string
 }
 
 type Options struct {
@@ -42,6 +50,8 @@ type Options struct {
 	Policy    config.Policy
 	Executor  executor.Executor
 	Runner    RunnerSource
+	// Cache is nil when the owner has not set a cache directory.
+	Cache     CacheSource
 	Log       *slog.Logger
 	Resources executor.Resources
 	// Now is the clock used for active hours (tests override it).
@@ -51,10 +61,12 @@ type Options struct {
 }
 
 type assignment struct {
-	id     string
-	state  protocol.AgentAssignmentState
-	reason string
-	cancel context.CancelFunc
+	id string
+	// platform is the guest platform of the assignment's image.
+	platform string
+	state    protocol.AgentAssignmentState
+	reason   string
+	cancel   context.CancelFunc
 	// stopReason is set when the control plane asked us to stop.
 	stopReason string
 	// reported is false while a terminal state has not reached the control plane yet.
@@ -411,13 +423,34 @@ func (a *Agent) setState(id string, s protocol.AgentAssignmentState, reason stri
 
 // ----- capacity and images -----
 
+// slotsTotal is the owner's cap on VMs of any kind. A guest platform may have a lower limit
+// of its own (guestLimit).
 func (a *Agent) slotsTotal() int {
-	n := a.o.Policy.MaxVMs
+	return a.o.Policy.MaxVMs
+}
+
+// guestPlatform is an image's guest platform; images from before the field are macOS.
+func guestPlatform(image protocol.ImageSpec) string {
+	if image.Platform == "" {
+		return "darwin"
+	}
+	return image.Platform
+}
+
+// guestLimit is the most VMs of a guest platform this host may run at once, or 0 if only
+// slotsTotal limits them. Apple allows two macOS guests per host.
+func (a *Agent) guestLimit(platform string) int {
+	return a.o.Executor.MaxVMs(protocol.ImageSpec{Platform: platform})
+}
+
+// activeOn counts running VMs of one guest platform.
+func (a *Agent) activeOn(platform string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, img := range a.images {
-		if lim := a.o.Executor.MaxVMs(img); lim > 0 && lim < n {
-			n = lim
+	n := 0
+	for _, as := range a.assignments {
+		if !isTerminal(as.state) && as.platform == platform {
+			n++
 		}
 	}
 	return n
@@ -454,7 +487,11 @@ func (a *Agent) sendCapacity() {
 	}
 	a.mu.Unlock()
 	sort.Strings(ready)
-	a.send(&protocol.Capacity{Type: protocol.TypeCapacity, SlotsTotal: total, SlotsFree: free, ImagesReady: ready, Accepting: a.accepting()})
+	var guests []protocol.GuestCapacity
+	for _, p := range a.o.Executor.GuestPlatforms() {
+		guests = append(guests, protocol.GuestCapacity{Platform: p, Limit: a.guestLimit(p)})
+	}
+	a.send(&protocol.Capacity{Type: protocol.TypeCapacity, SlotsTotal: total, SlotsFree: free, ImagesReady: ready, Accepting: a.accepting(), Guests: guests})
 }
 
 // applyConfig records the images the control plane wants and prepares those policy allows.

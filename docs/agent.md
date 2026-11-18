@@ -64,16 +64,88 @@ The control plane cannot override these. A `start` that breaks the policy is ans
 
 | Field | Default | Meaning |
 |---|---|---|
-| `max_vms` | 2 | Concurrent VMs. macOS guests are also capped at two by Apple's licence. |
+| `max_vms` | 2 | Concurrent VMs of any kind. Of those, at most two can be macOS guests, which is Apple's rule; Linux guests are limited only by this number. |
 | `allowed_images` | any image in the pool configuration | Glob patterns on image sources, for example `ghcr.io/cirruslabs/*` |
 | `allowed_github_urls` | any | Repository or organization URLs a runner may register with; read from the just-in-time config |
-| `cpus`, `memory_mb` | half the host | Per VM |
+| `cpus`, `memory_mb` | an equal share | Per VM. By default the host divided by `max_vms`, and never more than half. |
 | `active_hours` | always | Local time window such as `22:00-07:00`; outside it the host reports no capacity |
 | `stay_awake` | true | Holds `caffeinate -i` while any VM runs |
 | `isolate_network` | true | Internet-only VM networking through Tart's Softnet, when available |
 | `require_network_isolation` | false | Refuse VMs rather than fall back to shared networking |
 | `shared_runner` | true | Keep a current Actions runner on the host and share it into each VM |
 | `image_refresh_hours` | 24 | Re-pull images this often; 0 disables |
+| `disk_gb` | the image's size | Disk size of each VM. A disk can grow but not shrink, so a value below the image's is ignored. The space is only used as a job fills it. |
+| `xcode` | none | Path of an Xcode.app on this host to copy into macOS images; see below |
+| `preload_images` | none | Container images to pull into Linux images on this host; see below |
+| `cache_dir` | none | Host directory where jobs keep downloads between runs; see below |
+| `cache_scope` | `runner` | Who shares a cache: `runner` or `host` |
+| `cache_max_gb` | no limit | Above this, the least recently used caches are deleted |
+
+## Xcode from the host
+
+Images that anyone may download cannot contain Xcode, because Apple's licence does not allow
+passing it on. With `"xcode": "/Applications/Xcode.app"` the agent adds your own copy instead:
+when it prepares an image, it boots the image once, copies that Xcode onto the VM's disk,
+selects it, accepts the licence, runs Xcode's first-launch setup, and shuts
+the VM down. Jobs clone the result, so they pay nothing for it.
+
+- It takes a few minutes per image, and again when the image or the host's Xcode changes. The
+  host is not ready for the pool until it is done.
+- The VM's disk is grown by Xcode's size plus 5 GB.
+- Simulator runtimes are not copied. A job that needs one downloads it with
+  `xcodebuild -downloadPlatform iOS`.
+- The image must allow `sudo` without a password, as ours and Cirrus Labs' do, and its macOS
+  must be new enough for that Xcode.
+- If the path is wrong or the copy fails, the image is not prepared and the agent logs why.
+
+## Linux guests
+
+A Mac host runs Linux VMs as well as macOS ones, with the same isolation: one fresh VM per job.
+A pool whose image has `"platform": "linux"` gets them. They are arm64, like the host, so a
+job's own container images must be built for arm64.
+
+Linux guests are not subject to Apple's limit of two, so raise `max_vms` to run more at once;
+each VM then gets a smaller share of the host unless you set `cpus` and `memory_mb`.
+
+The image needs the Tart guest agent, `sudo` without a password, and Docker if jobs use
+`container:` or `services:`. Ours is `ghcr.io/my-compute-cloud/ubuntu-runner`.
+
+### Container images that are already there
+
+A job that starts `mysql:8.4` as a service normally pulls it first, every time, because its VM
+is new. With
+
+```json
+{ "preload_images": ["mysql:8.4", "redis:8"] }
+```
+
+the agent pulls those into its copy of each Linux image once, when it prepares the image, and
+again at every refresh so that the tags stay current. Jobs clone that copy, so their containers
+start without a pull. It needs Docker in the image. An image a workflow builds anew for each
+run cannot be preloaded; only its unchanged layers would help, and those are not shared yet.
+
+## Job caches
+
+A job's VM is deleted when the job ends, and its downloads with it. With `cache_dir` set, each
+job gets one subdirectory of it as a writable share, and the entry command sets `MCC_CACHE_DIR`
+to it. What uses it is up to the image: ours points the download caches of npm, Yarn, pip, uv,
+Go modules, NuGet and Homebrew there, in `/etc/mcc/job-env`, which the entry command reads if
+the image has it.
+
+This is the one way a job can leave something for a later job, so decide who shares:
+
+- `cache_scope: "runner"` (the default) keeps one cache per repository or organization that
+  runners register with. Runners for a personal account register per repository; runners for
+  an organization register with the organization, so all its repositories share one.
+- `cache_scope: "host"` gives every job on the host the same cache. Only for hosts where you
+  trust every job.
+
+Within a scope, any job can write what a later job reads, including a job for a pull request
+from a fork. Leave `cache_dir` unset on hosts that run code from people you do not trust.
+
+Caches are plain directories under `cache_dir/data`; deleting one only costs the next job its
+downloads. With `cache_max_gb`, the agent deletes whole caches, least recently used first, when
+the total passes the limit, and never one a running job is using.
 
 ## Network isolation
 
@@ -85,13 +157,18 @@ shared networking unless `require_network_isolation` is set.
 
 ## What a job looks like on the host
 
-1. The image's base VM (`mcc-base-<hash>`) is cloned once per image; each job clones it to
+1. The image's base VM (`mcc-base-<hash>`, with a suffix when the host adds Xcode or container
+   images to it) is cloned once per image; each job clones it to
    `mcc-<assignment id>` (copy-on-write on APFS).
 2. The clone boots headless; the agent waits for the Tart guest agent (`tart exec`). Images must
-   include the guest agent, which all non-vanilla Cirrus Labs images do. No SSH is used.
-3. The fixed entry command copies the shared runner into the guest (or uses `~/actions-runner`
-   from the image) and runs `run.sh --jitconfig`, with the configuration on stdin so it never
-   appears in the host's process list.
+   include the guest agent, which our images (`ghcr.io/my-compute-cloud/macos-runner`) and all
+   non-vanilla Cirrus Labs images do. No SSH is used. A job's `PATH` and environment are the
+   guest agent's, because the entry command's shell reads no profile.
+3. The fixed entry command (one for macOS guests, one for Linux, which first mounts the
+   host's shares) copies the shared runner into the guest (or uses `~/actions-runner`
+   from the image), reads `/etc/mcc/job-env` if the image has one, and runs
+   `run.sh --jitconfig`, with the configuration on stdin so it never appears in the host's
+   process list.
 4. When the runner exits, or the control plane sends `stop`, or the runner has not taken a job
    within the idle timeout, the VM is stopped and deleted, and only then is the final status sent.
 5. On start-up the agent deletes any `mcc-*` job VMs left from a crash.

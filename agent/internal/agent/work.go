@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,9 +25,15 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// runnerShare is the share name the runner directory is mounted under in macOS guests:
-// /Volumes/My Shared Files/<name>.
+// runnerShare is the share name of the runner directory. macOS guests mount shares by
+// themselves at /Volumes/My Shared Files/<name>; Linux guests do not, so the entry command
+// mounts them at linuxShares/<name>.
 const runnerShare = "mcc-runner"
+
+const linuxShares = "/mnt/mcc"
+
+// cacheShare is the share name of the job's cache directory, when the owner provides one.
+const cacheShare = "mcc-cache"
 
 // githubRunnerScript is the fixed entry command for the github-runner workload. The JIT
 // configuration arrives on stdin so it never appears in a process list on the host.
@@ -39,9 +46,54 @@ if [ -x "$SHARED/run.sh" ]; then
   cp -R "$SHARED" "$RUNNER.mcc"
   RUNNER="$RUNNER.mcc"
 fi
+# The owner's cache for this job, if any, and the image's own say on what to do with it:
+# an image may set up the job's environment in /etc/mcc/job-env.
+# The cache is reached through a link without spaces in its path, which some build tools
+# cannot handle.
+if [ -d "/Volumes/My Shared Files/` + cacheShare + `" ]; then
+  ln -sfn "/Volumes/My Shared Files/` + cacheShare + `" "$HOME/.mcc-cache"
+  export MCC_CACHE_DIR="$HOME/.mcc-cache"
+fi
+if [ -r /etc/mcc/job-env ]; then
+  . /etc/mcc/job-env
+fi
 cd "$RUNNER"
 exec ./run.sh --jitconfig "$JIT"
 `
+
+// githubRunnerScriptLinux is the same for Linux guests.
+const githubRunnerScriptLinux = `set -euo pipefail
+IFS= read -r JIT
+SHARES="` + linuxShares + `"
+if ! mountpoint -q "$SHARES"; then
+  sudo mkdir -p "$SHARES"
+  # Fails when the host shares nothing, which is fine.
+  sudo mount -t virtiofs com.apple.virtio-fs.automount "$SHARES" 2>/dev/null || true
+fi
+RUNNER="$HOME/actions-runner"
+if [ -x "$SHARES/` + runnerShare + `/run.sh" ]; then
+  rm -rf "$RUNNER.mcc"
+  cp -R "$SHARES/` + runnerShare + `" "$RUNNER.mcc"
+  RUNNER="$RUNNER.mcc"
+fi
+if [ -d "$SHARES/` + cacheShare + `" ]; then
+  ln -sfn "$SHARES/` + cacheShare + `" "$HOME/.mcc-cache"
+  export MCC_CACHE_DIR="$HOME/.mcc-cache"
+fi
+if [ -r /etc/mcc/job-env ]; then
+  . /etc/mcc/job-env
+fi
+cd "$RUNNER"
+exec ./run.sh --jitconfig "$JIT"
+`
+
+// entryScript is the fixed entry command for an image's guest platform.
+func entryScript(image protocol.ImageSpec) string {
+	if guestPlatform(image) == "linux" {
+		return githubRunnerScriptLinux
+	}
+	return githubRunnerScript
+}
 
 // The runner prints this when it accepts a job.
 const jobTakenMarker = "Running job:"
@@ -79,6 +131,13 @@ func (a *Agent) policyCheck(m protocol.Start) string {
 	if a.activeCount() >= a.slotsTotal() {
 		return "no free slot"
 	}
+	platform := guestPlatform(m.Image)
+	if !slices.Contains(a.o.Executor.GuestPlatforms(), platform) {
+		return fmt.Sprintf("this host cannot run %s guests", platform)
+	}
+	if lim := a.guestLimit(platform); lim > 0 && a.activeOn(platform) >= lim {
+		return fmt.Sprintf("this host already runs %d %s guests, the most allowed", lim, platform)
+	}
 	return ""
 }
 
@@ -109,6 +168,16 @@ func jitGitHubURL(encoded string) (string, error) {
 	return settings.GitHubURL, nil
 }
 
+// jobCache is the cache directory for the repository or organization this job's runner
+// registers with.
+func (a *Agent) jobCache(m protocol.Start) (string, func(), error) {
+	u, err := jitGitHubURL(m.Workload.JITConfig)
+	if err != nil {
+		return "", nil, fmt.Errorf("could not read the runner configuration to choose a cache: %w", err)
+	}
+	return a.o.Cache.Acquire(u)
+}
+
 func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
 	a.mu.Lock()
 	if existing, ok := a.assignments[m.AssignmentID]; ok {
@@ -127,7 +196,7 @@ func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
-	as := &assignment{id: m.AssignmentID, state: protocol.AgentAssignmentStateStarting, cancel: cancel}
+	as := &assignment{id: m.AssignmentID, platform: guestPlatform(m.Image), state: protocol.AgentAssignmentStateStarting, cancel: cancel}
 	a.mu.Lock()
 	a.assignments[m.AssignmentID] = as
 	a.mu.Unlock()
@@ -190,9 +259,24 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 		Resources:      a.o.Resources,
 		IsolateNetwork: a.o.Policy.NetworkIsolation() && a.isolationOK,
 	}
-	if a.o.Policy.SharedRunnerEnabled() && a.o.Runner != nil && m.Image.Platform != "linux" {
-		if dir := a.o.Runner.Current(); dir != "" {
-			opts.SharedDirs = map[string]string{runnerShare: dir}
+	opts.SharedDirs = map[string]executor.SharedDir{}
+	if a.o.Policy.SharedRunnerEnabled() && a.o.Runner != nil {
+		if dir := a.o.Runner.Current(guestPlatform(m.Image)); dir != "" {
+			opts.SharedDirs[runnerShare] = executor.SharedDir{Path: dir}
+		}
+	}
+	if a.o.Cache != nil {
+		// A job that cannot be placed in a cache runs without one rather than sharing
+		// someone else's.
+		if dir, release, err := a.jobCache(m); err != nil {
+			lg.Warn("running without a cache", "err", err)
+		} else {
+			opts.SharedDirs[cacheShare] = executor.SharedDir{Path: dir, Writable: true}
+			// Registered before the VM's own cleanup, so it runs after the VM is gone.
+			defer func() {
+				release()
+				go a.o.Cache.Prune()
+			}()
 		}
 	}
 	started := time.Now()
@@ -239,7 +323,7 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 
 	a.setState(as.id, protocol.AgentAssignmentStateRunning, "")
 	code, err := a.o.Executor.Exec(ctx, h, executor.Command{
-		Script: githubRunnerScript,
+		Script: entryScript(m.Image),
 		Stdin:  strings.NewReader(m.Workload.JITConfig + "\n"),
 		Output: pw,
 	})

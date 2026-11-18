@@ -16,7 +16,9 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/my-compute-cloud/mcc/agent/internal/cache"
 	"github.com/my-compute-cloud/mcc/agent/internal/config"
+	"github.com/my-compute-cloud/mcc/agent/internal/executor"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/fake"
 	"github.com/my-compute-cloud/mcc/agent/internal/identity"
 	"github.com/my-compute-cloud/mcc/agent/internal/protocol"
@@ -131,10 +133,14 @@ func isType(t string) func(map[string]any) bool {
 }
 
 func startAgent(t *testing.T, policy config.Policy, f *fake.Fake) (*controlPlane, context.CancelFunc, chan struct{}) {
+	return startAgentWith(t, policy, f, nil)
+}
+
+func startAgentWith(t *testing.T, policy config.Policy, f *fake.Fake, cacheSource CacheSource) (*controlPlane, context.CancelFunc, chan struct{}) {
 	id := identity.FromSeed(make([]byte, 32))
 	cp := newControlPlane(t, id)
 	a := New(Options{
-		ServerURL: cp.srv.URL, HostID: "host-1", Identity: id, Policy: policy, Executor: f,
+		ServerURL: cp.srv.URL, HostID: "host-1", Identity: id, Policy: policy, Executor: f, Cache: cacheSource,
 		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MinBackoff: 20 * time.Millisecond, MaxBackoff: 50 * time.Millisecond,
 	})
@@ -298,6 +304,91 @@ func TestIdleTimeoutStopsUnusedRunner(t *testing.T) {
 	m := cp.next(status("f1", "finished"))
 	if m["reason"] != "idle timeout" {
 		t.Fatalf("reason %v", m["reason"])
+	}
+}
+
+func TestLinuxGuestsHaveTheirOwnEntryAndLimit(t *testing.T) {
+	f := fake.New()
+	f.Block = true // VMs stay up until stopped
+	policy := config.DefaultPolicy()
+	policy.MaxVMs = 5
+	cp, _, _ := startAgent(t, policy, f)
+	<-cp.hellos
+	c := cp.next(isType("capacity"))
+	guests, _ := json.Marshal(c["guests"])
+	if string(guests) != `[{"limit":2,"platform":"darwin"},{"limit":0,"platform":"linux"}]` || c["slots_total"].(float64) != 5 {
+		t.Fatalf("capacity %v", c)
+	}
+
+	linux := protocol.ImageSpec{Name: "ubuntu", Source: "ghcr.io/x:ubuntu", Platform: "linux"}
+	cp.send(map[string]any{"type": "config", "pools": []protocol.PoolConfig{}, "images": []protocol.ImageSpec{image, linux}})
+	start := func(id string, img protocol.ImageSpec) {
+		m := startMsg(id)
+		m["image"] = img
+		cp.send(m)
+	}
+	// Two macOS guests is the most; Linux guests use the remaining slots.
+	for _, id := range []string{"m1", "m2"} {
+		start(id, image)
+		cp.next(status(id, "running"))
+	}
+	start("m3", image)
+	if m := cp.next(status("m3", "failed")); !strings.Contains(m["reason"].(string), "2 darwin guests") {
+		t.Fatalf("reason %v", m["reason"])
+	}
+	for _, id := range []string{"l1", "l2", "l3"} {
+		start(id, linux)
+		cp.next(status(id, "running"))
+	}
+	start("l4", linux)
+	if m := cp.next(status("l4", "failed")); !strings.Contains(m["reason"].(string), "no free slot") {
+		t.Fatalf("reason %v", m["reason"])
+	}
+	if !strings.Contains(f.Script("l1"), "mount -t virtiofs") || strings.Contains(f.Script("m1"), "mount -t virtiofs") {
+		t.Fatal("guests were not given the entry command for their platform")
+	}
+}
+
+// jitFor is a just-in-time configuration for a runner registered with a repository.
+func jitFor(githubURL string) string {
+	runner := base64.StdEncoding.EncodeToString([]byte(`{"gitHubUrl":"` + githubURL + `"}`))
+	files, _ := json.Marshal(map[string]string{".runner": runner})
+	return base64.StdEncoding.EncodeToString(files)
+}
+
+func TestJobsGetTheirRepositorysCache(t *testing.T) {
+	f := fake.New()
+	c := cache.New(t.TempDir(), "", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	policy := config.DefaultPolicy()
+	policy.DiskGB = 150
+	cp, _, _ := startAgentWith(t, policy, f, c)
+	<-cp.hellos
+	cp.next(isType("capacity"))
+
+	run := func(id, jit string) executor.StartOptions {
+		m := startMsg(id)
+		m["workload"].(map[string]any)["jit_config"] = jit
+		cp.send(m)
+		cp.next(status(id, "finished"))
+		return f.Options[id]
+	}
+	one := run("c1", jitFor("https://github.com/acme/one"))
+	two := run("c2", jitFor("https://github.com/acme/two"))
+	again := run("c3", jitFor("https://github.com/acme/one"))
+
+	share := one.SharedDirs["mcc-cache"]
+	if !share.Writable || !strings.HasSuffix(share.Path, "github.com+acme+one") {
+		t.Fatalf("cache share %+v", share)
+	}
+	if two.SharedDirs["mcc-cache"].Path == share.Path {
+		t.Fatal("two repositories were given the same cache")
+	}
+	if again.SharedDirs["mcc-cache"].Path != share.Path {
+		t.Fatal("a repository's second job got a different cache")
+	}
+	// A job whose repository cannot be told runs, without a cache.
+	if unknown := run("c4", "secret-jit"); len(unknown.SharedDirs) != 0 {
+		t.Fatalf("a job of unknown origin was given %+v", unknown.SharedDirs)
 	}
 }
 

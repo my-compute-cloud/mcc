@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/my-compute-cloud/mcc/agent/internal/agent"
+	"github.com/my-compute-cloud/mcc/agent/internal/cache"
 	"github.com/my-compute-cloud/mcc/agent/internal/config"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/fake"
@@ -148,7 +149,10 @@ func run(args []string) error {
 		f.JobDuration = 200 * time.Millisecond
 		ex = f
 	case "", "tart":
-		ex = tart.New(log)
+		t := tart.New(log)
+		t.Xcode = policy.Xcode
+		t.Preload = policy.PreloadImages
+		ex = t
 	default:
 		return fmt.Errorf("unknown MCC_EXECUTOR %q", os.Getenv("MCC_EXECUTOR"))
 	}
@@ -156,10 +160,23 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var runner *runnerbin.Manager
+	// One Actions runner per guest platform: macOS and Linux guests each need their own build.
+	var runners runnerSet
 	if policy.SharedRunnerEnabled() && os.Getenv("MCC_EXECUTOR") != "fake" {
-		runner = runnerbin.New(filepath.Join(dir, "runner"), runnerPlatform())
-		go keepRunnerCurrent(ctx, runner, log)
+		runners = runnerSet{
+			"darwin": runnerbin.New(filepath.Join(dir, "runner"), "osx-"+runnerArch()),
+			"linux":  runnerbin.New(filepath.Join(dir, "runner-linux"), "linux-"+runnerArch()),
+		}
+		for platform, m := range runners {
+			go keepRunnerCurrent(ctx, platform, m, log)
+		}
+	}
+
+	var jobCache agent.CacheSource
+	if policy.CacheDir != "" {
+		c := cache.New(policy.CacheDir, policy.CacheScope, policy.CacheMaxGB, log)
+		go c.Prune()
+		jobCache = c
 	}
 
 	a := agent.New(agent.Options{
@@ -168,7 +185,8 @@ func run(args []string) error {
 		Identity:  id,
 		Policy:    policy,
 		Executor:  ex,
-		Runner:    runnerSource(runner),
+		Runner:    runnerSource(runners),
+		Cache:     jobCache,
 		Log:       log,
 		Resources: resources(policy),
 	})
@@ -176,20 +194,30 @@ func run(args []string) error {
 	return a.Run(ctx)
 }
 
-func runnerSource(m *runnerbin.Manager) agent.RunnerSource {
-	if m == nil {
-		return nil
+// runnerSet holds the runner for each guest platform.
+type runnerSet map[string]*runnerbin.Manager
+
+func (r runnerSet) Current(platform string) string {
+	if m := r[platform]; m != nil {
+		return m.Current()
 	}
-	return m
+	return ""
 }
 
-func keepRunnerCurrent(ctx context.Context, m *runnerbin.Manager, log *slog.Logger) {
+func runnerSource(r runnerSet) agent.RunnerSource {
+	if r == nil {
+		return nil
+	}
+	return r
+}
+
+func keepRunnerCurrent(ctx context.Context, platform string, m *runnerbin.Manager, log *slog.Logger) {
 	for {
 		dir, err := m.Update(ctx)
 		if err != nil {
-			log.Warn("updating Actions runner failed; VMs will use the image's runner if none is cached", "err", err)
+			log.Warn("updating Actions runner failed; VMs will use the image's runner if none is cached", "guests", platform, "err", err)
 		} else {
-			log.Info("Actions runner ready", "dir", dir)
+			log.Info("Actions runner ready", "guests", platform, "dir", dir)
 		}
 		select {
 		case <-ctx.Done():
@@ -199,23 +227,26 @@ func keepRunnerCurrent(ctx context.Context, m *runnerbin.Manager, log *slog.Logg
 	}
 }
 
-// runnerPlatform is the Actions runner build for macOS guests on this host.
-func runnerPlatform() string {
+// runnerArch is the architecture in the Actions runner's build names. Guests have the host's.
+func runnerArch() string {
 	if runtime.GOARCH == "amd64" {
-		return "osx-x64"
+		return "x64"
 	}
-	return "osx-arm64"
+	return "arm64"
 }
 
-// resources applies the policy, defaulting to half the host per VM.
+// resources applies the policy. By default each VM gets an equal share of the host, as if
+// max_vms of them ran at once, and never more than half: a host with max_vms 2 or less gives
+// each VM half, as it always has.
 func resources(p config.Policy) executor.Resources {
-	r := executor.Resources{CPUs: p.CPUs, MemoryMB: p.MemoryMB}
+	r := executor.Resources{CPUs: p.CPUs, MemoryMB: p.MemoryMB, DiskGB: p.DiskGB}
+	share := max(2, p.MaxVMs)
 	if r.CPUs == 0 {
-		r.CPUs = max(1, runtime.NumCPU()/2)
+		r.CPUs = max(1, runtime.NumCPU()/share)
 	}
 	if r.MemoryMB == 0 {
 		if total := hostMemoryMB(); total > 0 {
-			r.MemoryMB = total / 2
+			r.MemoryMB = total / share
 		}
 	}
 	return r

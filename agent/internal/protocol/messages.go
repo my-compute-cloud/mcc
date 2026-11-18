@@ -96,6 +96,16 @@ type Capacity struct {
 	ImagesReady []string `json:"images_ready"`
 	// False outside active hours or while draining
 	Accepting bool `json:"accepting"`
+	// Guest platforms this host can run. Absent from agents that only run macOS guests
+	Guests []GuestCapacity `json:"guests,omitempty"`
+}
+
+// GuestCapacity: One guest platform a host can run, and its own limit within the host's slots.
+type GuestCapacity struct {
+	// ImageSpec.platform: darwin or linux
+	Platform string `json:"platform"`
+	// Most VMs of this platform at once; 0 means only slots_total limits them
+	Limit int `json:"limit"`
 }
 
 type Status struct {

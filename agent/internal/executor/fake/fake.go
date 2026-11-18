@@ -20,6 +20,10 @@ type Fake struct {
 	Started  []string
 	Stopped  []string
 	Stdin    map[string]string
+	// Scripts records the entry command each machine was given, by assignment.
+	Scripts map[string]string
+	// Options records what each machine was started with, by assignment.
+	Options map[string]executor.StartOptions
 
 	// JobDuration is how long Exec "runs" after taking a job. Zero exits immediately.
 	JobDuration time.Duration
@@ -34,7 +38,7 @@ type Fake struct {
 }
 
 func New() *Fake {
-	return &Fake{prepared: map[string]bool{}, vms: map[string]executor.Handle{}, Stdin: map[string]string{}, TakeJob: true}
+	return &Fake{prepared: map[string]bool{}, vms: map[string]executor.Handle{}, Stdin: map[string]string{}, Options: map[string]executor.StartOptions{}, Scripts: map[string]string{}, TakeJob: true}
 }
 
 func (f *Fake) Prepare(_ context.Context, image protocol.ImageSpec) error {
@@ -54,9 +58,10 @@ func (f *Fake) Ready(_ context.Context, image protocol.ImageSpec) bool {
 	return f.prepared[image.Source]
 }
 
-func (f *Fake) Start(_ context.Context, id string, image protocol.ImageSpec, _ executor.StartOptions) (executor.Handle, error) {
+func (f *Fake) Start(_ context.Context, id string, image protocol.ImageSpec, opts executor.StartOptions) (executor.Handle, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.Options[id] = opts
 	h := executor.Handle{AssignmentID: id, Name: "mcc-" + id}
 	if f.FailStart != nil {
 		return h, f.FailStart
@@ -70,6 +75,9 @@ func (f *Fake) Start(_ context.Context, id string, image protocol.ImageSpec, _ e
 }
 
 func (f *Fake) Exec(ctx context.Context, h executor.Handle, c executor.Command) (int, error) {
+	f.mu.Lock()
+	f.Scripts[h.AssignmentID] = c.Script
+	f.mu.Unlock()
 	if c.Stdin != nil {
 		b, _ := io.ReadAll(c.Stdin)
 		f.mu.Lock()
@@ -127,10 +135,23 @@ func (f *Fake) Running() int {
 	return len(f.vms)
 }
 
-func (f *Fake) NetworkIsolationAvailable() bool     { return true }
-func (f *Fake) MaxVMs(image protocol.ImageSpec) int { return 2 }
+func (f *Fake) NetworkIsolationAvailable() bool { return true }
+func (f *Fake) MaxVMs(image protocol.ImageSpec) int {
+	if image.Platform == "linux" {
+		return 0
+	}
+	return 2
+}
+func (f *Fake) GuestPlatforms() []string { return []string{"darwin", "linux"} }
 func (f *Fake) Snapshot() (started, stopped []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.Started...), append([]string(nil), f.Stopped...)
+}
+
+// Script is the entry command the machine for an assignment was given.
+func (f *Fake) Script(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Scripts[id]
 }
