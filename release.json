@@ -1,6 +1,6 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "assets": {
-    "aarch64-darwin": { "url": "https://github.com/my-compute-cloud/mcc/releases/download/v0.1.0/mcc-darwin-arm64.tar.gz", "sha256": "62555481001b4ce43540f04aad01ec112cb3a8d82e34d4af8b321f42c062f5f3" }
+    "aarch64-darwin": { "url": "https://github.com/my-compute-cloud/mcc/releases/download/v0.2.0/mcc-darwin-arm64.tar.gz", "sha256": "96db90d12bf733375264c671849e246c14b085c852f20298e807b94e23d29249" }
   }
 }
