@@ -90,6 +90,8 @@ The control plane cannot override these. A `start` that breaks the policy is ans
 | `cache_dir` | none | Host directory where jobs keep downloads between runs; see below |
 | `cache_scope` | `runner` | Who shares a cache: `runner` or `host` |
 | `cache_max_gb` | no limit | Above this, the least recently used caches are deleted |
+| `host_tasks` | off | Lets work run on the host itself, without a VM; see [below](#jobs-on-the-host-itself) |
+| `tasks` | none | Commands the control plane may ask this host to run, by name; see [below](#tasks) |
 
 ## Xcode from the host
 
@@ -258,6 +260,121 @@ from a fork. Leave `cache_dir` unset on hosts that run code from people you do n
 Caches are plain directories under `cache_dir/data`; deleting one only costs the next job its
 downloads. With `cache_max_gb`, the agent deletes whole caches, least recently used first, when
 the total passes the limit, and never one a running job is using.
+
+## Jobs on the host itself
+
+A VM for every job costs a boot and starts from nothing. Where you trust the work and the
+machine's own state is the point (a warm checkout, installed toolchains, a GPU), a pool can
+run its jobs on the host itself instead: create it with `"isolation": "host"` and no image.
+A host only takes such work if its policy says so:
+
+```json
+"allowed_github_urls": ["https://github.com/your-org"],
+"host_tasks": {
+  "enabled": true,
+  "github_runner": true,
+  "user": "mcc-job",
+  "dir": "/Users/mcc-job/work",
+  "max": 2,
+  "workspace": "fresh"
+}
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `enabled` | false | Whether this host runs work without a VM at all |
+| `github_runner` | false | Whether GitHub Actions jobs may. A workflow is arbitrary code, so this is its own yes, and it needs `allowed_github_urls`: without a list, nothing is allowed here |
+| `user` | none | The account work runs as. The agent enters it with `sudo -n`, so the agent's account must be allowed to run commands as it without a password |
+| `allow_same_user` | false | Run work as the agent's own account instead. One of this and `user` must be set |
+| `dir` | `work/` in the agent's directory | Where each job gets its directory. Required with `user`, and that account must be able to write to it |
+| `max` | 1 | Jobs on the host at once. Counted apart from `max_vms` |
+| `workspace` | `fresh` | `fresh` or `persistent`; see below |
+
+**This is not isolation.** A job on the host can do whatever its account can. Run as the
+agent's own account, that includes reading the agent's key, editing this policy and changing
+the runner that VM jobs are given, which is why `allow_same_user` has to be said out loud. A
+dedicated account with nothing of yours in its reach is the better choice.
+
+What happens to a job:
+
+1. The agent makes `job-<assignment id>` in `dir` and copies the host's current runner into it.
+   The runner is still registered for one job only.
+2. The runner starts there, with its configuration in its environment (which the runner reads
+   and clears), never on its command line. With `cache_dir` set, `MCC_CACHE_DIR` names the
+   job's cache. A job run as `user` has that account's login environment; one run as the
+   agent's account has the agent's `PATH` and `HOME` and nothing else of its environment.
+3. When the runner exits, the agent kills whatever the job started that is still in its
+   process group, and deletes the directory. With `user`, and no other job running as it, the
+   agent also kills everything that account still runs.
+
+What the agent cannot clean up: a process that left the job's group when work runs as the
+agent's own account, and anything written outside the job's directory. `fresh` promises a
+clean directory, not a clean machine.
+
+`"workspace": "persistent"` keeps the runner's work folder between jobs, in `dir/keep`, one per
+repository or organization that runners register with, so the next job finds its checkout and
+tool downloads. Two jobs never use one at the same time; a second concurrent job gets its own.
+Downloaded actions and temporary files are deleted before and after every job, because the
+next job would run a cached action as it found it. The checkout is not: a job can leave a
+change there, a git hook for one, for the next job of the same repository. Use it where every
+job that shares a workspace is equally trusted, which for a repository that builds pull
+requests from forks it is not.
+
+There is no network isolation for such work, so a host with `require_network_isolation`
+refuses it. `cpus`, `memory_mb` and `disk_gb` do not apply.
+
+## Tasks
+
+A task is a command you write in this host's policy and give a name. Someone with an API token
+for your account can then ask for it by that name
+([operations.md](operations.md#running-tasks)), and that is all they can ask for: a request
+carries a task's name and values for its parameters, never a command. Tasks run on the host
+itself, so they need `host_tasks`, and they run as the account it names.
+
+```json
+"host_tasks": { "enabled": true, "user": "mcc-job", "dir": "/Users/mcc-job/work" },
+"tasks": {
+  "test-ios": {
+    "command": ["/usr/bin/make", "-C", "/Users/mcc-job/app", "test"],
+    "params": { "SCHEME": "[A-Za-z0-9_-]{1,40}" },
+    "timeout_seconds": 3600,
+    "max_concurrent": 1
+  }
+}
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `command` | required | The program, by its full path, and its arguments. It is run as written; no shell reads it, so `$HOME` or `;` in an argument is just text |
+| `params` | none | The parameters a request may set, each with a pattern its value must match from start to end. A request that sets any other parameter is refused. A request may leave one out |
+| `timeout_seconds` | 3600 | The longest a run may last. A request can ask for less, not more |
+| `max_concurrent` | no limit of its own | Runs of this task at once. `host_tasks.max` still limits everything on the host together |
+
+A parameter reaches the command as the environment variable `MCC_PARAM_<NAME>`, and never
+becomes part of a command line, so a value cannot add an argument or a second command. What
+the command does with the value is yours to get right: a script that passes `$MCC_PARAM_REF`
+to `git checkout` unquoted has let the caller choose its options. Keep patterns narrow.
+Parameter values are not secrets: on a host with `user` set they can be seen in the process
+list for a moment while the task starts.
+
+A run gets `job-<assignment id>` in `host_tasks.dir` as its working directory, named in
+`MCC_JOB_DIR` and deleted afterwards, and `MCC_TASK` holds the task's name. The command is
+free to work anywhere else its account can, which is the point of a task: your checkout, your
+toolchains, your devices. Cleanup is the same as for a job on the host.
+
+The host tells the control plane the names of its tasks, their time limits and
+`max_concurrent`, so that a task is only sent to a host that has it. It does not send the
+commands or the patterns. A run ends in one of these ways:
+
+| Outcome | What the agent reports |
+|---|---|
+| The command exits | `finished`, with its exit code |
+| It runs past its time limit | `failed`, code `timeout`; the agent kills it |
+| It is cancelled, or the agent shuts down | `failed`, code `stopped` |
+| The task is not in the policy, or a parameter is not allowed | `failed`, code `refused_policy`; nothing runs |
+| No free slot, or `max_concurrent` reached | `failed`, code `refused_capacity`; nothing runs |
+
+For now a task's output goes to the agent's log at debug level and nowhere else.
 
 ## Network isolation
 

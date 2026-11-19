@@ -42,6 +42,10 @@ type AssignmentReport struct {
 	AssignmentID string               `json:"assignment_id"`
 	State        AgentAssignmentState `json:"state"`
 	Reason       string               `json:"reason,omitempty"`
+	// Why it failed, for the control plane to act on: see Status.code
+	Code string `json:"code,omitempty"`
+	// A task's exit code, when it ran to an exit. Absent means 0
+	ExitCode int `json:"exit_code,omitempty"`
 }
 
 // ImageSpec: An image the agent may prepare and run.
@@ -54,21 +58,52 @@ type ImageSpec struct {
 	Platform string `json:"platform"`
 }
 
+// Isolation: Where work runs: in a virtual machine made for it, or directly on the host. Absent means vm.
+type Isolation string
+
+const (
+	IsolationVm   Isolation = "vm"
+	IsolationHost Isolation = "host"
+)
+
 type PoolConfig struct {
 	Name  string `json:"name"`
 	Label string `json:"label"`
-	// ImageSpec.name
-	Image string `json:"image"`
+	// ImageSpec.name. Absent for a pool whose work runs on the host itself
+	Image     string    `json:"image,omitempty"`
+	Isolation Isolation `json:"isolation,omitempty"`
 }
 
-// Workload: What to run inside the VM. The agent maps kind to a fixed entry command; there is no free-form command.
+// TaskParam: One parameter of a task. A list of these rather than an object, so that the generated types stay simple.
+type TaskParam struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// TaskCapacity: A task the host's owner has declared in its policy. The control plane sends a task only to hosts that list it.
+type TaskCapacity struct {
+	Name string `json:"name"`
+	// The longest the owner lets it run
+	TimeoutSeconds int `json:"timeout_seconds"`
+	// Most runs of it at once; 0 means only the host's slots limit them
+	MaxConcurrent int `json:"max_concurrent,omitempty"`
+}
+
+// Workload: What to run. The agent maps kind to a fixed entry command, or for a task to the command its owner declared under that name; there is no free-form command.
 type Workload struct {
-	Kind       string `json:"kind"`
-	RunnerName string `json:"runner_name"`
-	// GitHub just-in-time runner configuration, single use
-	JITConfig string `json:"jit_config"`
-	// Stop the VM if the runner has not taken a job by then
+	Kind string `json:"kind"`
+	// github-runner only
+	RunnerName string `json:"runner_name,omitempty"`
+	// github-runner only: GitHub just-in-time runner configuration, single use
+	JITConfig string `json:"jit_config,omitempty"`
+	// github-runner only: stop the work if the runner has not taken a job by then
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds,omitempty"`
+	// task only: the name of a task declared in the host's policy
+	Task string `json:"task,omitempty"`
+	// task only: values for the parameters the task declares
+	Params []TaskParam `json:"params,omitempty"`
+	// task only: stop it after this long, if that is sooner than the owner's own limit
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
 }
 
 // Hello: First message from the agent, answering challenge.
@@ -98,6 +133,11 @@ type Capacity struct {
 	Accepting bool `json:"accepting"`
 	// Guest platforms this host can run. Absent from agents that only run macOS guests
 	Guests []GuestCapacity `json:"guests,omitempty"`
+	// How much work this host runs directly, without a VM, at once. Absent or 0 unless its owner allows that
+	HostSlotsTotal int `json:"host_slots_total,omitempty"`
+	HostSlotsFree  int `json:"host_slots_free,omitempty"`
+	// Tasks this host's owner has declared. Absent if none
+	Tasks []TaskCapacity `json:"tasks,omitempty"`
 }
 
 // GuestCapacity: One guest platform a host can run, and its own limit within the host's slots.
@@ -115,6 +155,10 @@ type Status struct {
 	AssignmentID string               `json:"assignment_id"`
 	State        AgentAssignmentState `json:"state"`
 	Reason       string               `json:"reason,omitempty"`
+	// Why it failed, for the control plane to act on: refused_policy (the host's own rules forbid it; trying again will not help), refused_capacity (no room just now), timeout (a task ran past its limit) or stopped (a task was stopped before it ended). Absent otherwise
+	Code string `json:"code,omitempty"`
+	// A task's exit code, when it ran to an exit. Absent means 0
+	ExitCode int `json:"exit_code,omitempty"`
 }
 
 type Heartbeat struct {
@@ -157,8 +201,10 @@ type Start struct {
 	V            int       `json:"v"`
 	ID           string    `json:"id"`
 	AssignmentID string    `json:"assignment_id"`
-	Image        ImageSpec `json:"image"`
-	Workload     Workload  `json:"workload"`
+	Isolation    Isolation `json:"isolation,omitempty"`
+	// The VM's image. Absent when isolation is host
+	Image    ImageSpec `json:"image,omitempty"`
+	Workload Workload  `json:"workload"`
 }
 
 type Stop struct {

@@ -80,6 +80,21 @@ cd "$RUNNER"
 exec ./run.sh --jitconfig "$JIT"
 `
 
+// hostRunnerScript is the fixed entry command for a runner on the host itself. The executor
+// has copied the host's runner into the work's directory. The JIT configuration goes to the
+// runner in its environment, which the runner reads and clears, and not on its command line,
+// where every account on the host could read it.
+const hostRunnerScript = `set -euo pipefail
+IFS= read -r JIT
+cd "$MCC_JOB_DIR/` + runnerShare + `"
+export ACTIONS_RUNNER_INPUT_JITCONFIG="$JIT"
+unset JIT
+exec ./run.sh
+`
+
+// HostEntryScript is the fixed entry command of the github-runner workload on the host itself.
+func HostEntryScript() string { return hostRunnerScript }
+
 // EntryScript is the fixed entry command of the github-runner workload for an image's guest
 // platform, for tests that run it in a real VM.
 func EntryScript(image protocol.ImageSpec) string { return entryScript(image) }
@@ -95,84 +110,269 @@ func entryScript(image protocol.ImageSpec) string {
 // The runner prints this when it accepts a job.
 const jobTakenMarker = "Running job:"
 
-// policyCheck returns why a start must be refused, or "".
-func (a *Agent) policyCheck(m protocol.Start) string {
+// Codes that tell the control plane what kind of refusal a failed start was.
+const (
+	// The owner's rules forbid it; trying again will not help.
+	codeRefusedPolicy = "refused_policy"
+	// There is no room just now.
+	codeRefusedCapacity = "refused_capacity"
+	// A task ran past its time limit, or was stopped before it ended.
+	codeTimeout = "timeout"
+	codeStopped = "stopped"
+)
+
+const (
+	workloadGitHubRunner = "github-runner"
+	workloadTask         = "task"
+)
+
+// policyCheck returns why a start must be refused, with its code, or "".
+func (a *Agent) policyCheck(m protocol.Start) (reason, code string) {
+	if m.Isolation == protocol.IsolationHost {
+		return a.hostPolicyCheck(m)
+	}
 	p := a.o.Policy
 	if !p.Active(a.o.Now()) {
-		return "outside active hours"
+		return "outside active hours", codeRefusedCapacity
 	}
 	if p.RequireNetworkIsolation && !a.isolationOK {
-		return "network isolation required by policy but unavailable"
+		return "network isolation required by policy but unavailable", codeRefusedPolicy
 	}
 	if !p.ImageAllowed(m.Image.Source) {
-		return fmt.Sprintf("image %s not allowed by local policy", m.Image.Source)
+		return fmt.Sprintf("image %s not allowed by local policy", m.Image.Source), codeRefusedPolicy
 	}
 	a.mu.Lock()
 	known, ok := a.images[m.Image.Name]
 	a.mu.Unlock()
 	if !ok || known.Source != m.Image.Source {
-		return fmt.Sprintf("image %s is not in this host's pool configuration", m.Image.Name)
+		return fmt.Sprintf("image %s is not in this host's pool configuration", m.Image.Name), codeRefusedPolicy
 	}
-	if m.Workload.Kind != "github-runner" {
-		return fmt.Sprintf("unsupported workload %q", m.Workload.Kind)
+	if m.Workload.Kind != workloadGitHubRunner {
+		return fmt.Sprintf("unsupported workload %q", m.Workload.Kind), codeRefusedPolicy
 	}
 	if len(p.AllowedGitHubURLs) > 0 {
-		u, err := jitGitHubURL(m.Workload.JITConfig)
+		r, err := jitRunner(m.Workload.JITConfig)
 		if err != nil {
-			return "could not read runner configuration to check allowed_github_urls"
+			return "could not read runner configuration to check allowed_github_urls", codeRefusedPolicy
 		}
-		if !p.GitHubURLAllowed(u) {
-			return fmt.Sprintf("runner for %s not allowed by local policy", u)
+		if !p.GitHubURLAllowed(r.GitHubURL) {
+			return fmt.Sprintf("runner for %s not allowed by local policy", r.GitHubURL), codeRefusedPolicy
 		}
 	}
 	if a.activeCount() >= a.slotsTotal() {
-		return "no free slot"
+		return "no free slot", codeRefusedCapacity
 	}
 	platform := guestPlatform(m.Image)
 	if !slices.Contains(a.o.Executor.GuestPlatforms(), platform) {
-		return fmt.Sprintf("this host cannot run %s guests", platform)
+		return fmt.Sprintf("this host cannot run %s guests", platform), codeRefusedPolicy
 	}
 	if lim := a.guestLimit(platform); lim > 0 && a.activeOn(platform) >= lim {
-		return fmt.Sprintf("this host already runs %d %s guests, the most allowed", lim, platform)
+		return fmt.Sprintf("this host already runs %d %s guests, the most allowed", lim, platform), codeRefusedCapacity
 	}
-	return ""
+	return "", ""
 }
 
-// jitGitHubURL extracts the repository or organization URL from a just-in-time runner
-// configuration: base64 JSON mapping runner file names to base64 file contents.
-func jitGitHubURL(encoded string) (string, error) {
+// hostPolicyCheck is policyCheck for work that runs on the host itself. Such work is not
+// isolated from the host, so each thing it needs is something the owner said yes to.
+func (a *Agent) hostPolicyCheck(m protocol.Start) (reason, code string) {
+	p := a.o.Policy
+	if a.o.HostExecutor == nil || !p.HostTasks.Enabled {
+		return "this host does not run work without a VM (host_tasks in its policy)", codeRefusedPolicy
+	}
+	if p.RequireNetworkIsolation {
+		return "network isolation is required by policy, and work on the host itself has none", codeRefusedPolicy
+	}
+	if !p.Active(a.o.Now()) {
+		return "outside active hours", codeRefusedCapacity
+	}
+	if m.Workload.Kind == workloadTask {
+		return a.taskPolicyCheck(m.Workload)
+	}
+	if m.Workload.Kind != workloadGitHubRunner {
+		return fmt.Sprintf("unsupported workload %q", m.Workload.Kind), codeRefusedPolicy
+	}
+	if !p.HostTasks.GitHubRunner {
+		return "GitHub Actions jobs may not run on this host itself (host_tasks.github_runner in its policy)", codeRefusedPolicy
+	}
+	r, err := jitRunner(m.Workload.JITConfig)
+	if err != nil {
+		return "could not read runner configuration to check allowed_github_urls", codeRefusedPolicy
+	}
+	// An empty list allows anything in a VM. Here it allows nothing.
+	if len(p.AllowedGitHubURLs) == 0 || !p.GitHubURLAllowed(r.GitHubURL) {
+		return fmt.Sprintf("runner for %s not allowed by local policy", r.GitHubURL), codeRefusedPolicy
+	}
+	// The control plane chooses the runner's work folder. On the host it stays inside the
+	// work's own directory.
+	if r.WorkFolder != "" && r.WorkFolder != "_work" {
+		return fmt.Sprintf("runner work folder %q is not allowed on the host", r.WorkFolder), codeRefusedPolicy
+	}
+	if a.hostRunner() == "" {
+		return "this host has no Actions runner yet", codeRefusedCapacity
+	}
+	if a.hostActive() >= a.hostSlots() {
+		return "no free host slot", codeRefusedCapacity
+	}
+	return "", ""
+}
+
+// taskPolicyCheck is the rest of hostPolicyCheck for a task. The control plane sends a name
+// and parameters; whether there is such a task, and what its parameters may be, is the owner's
+// policy alone.
+func (a *Agent) taskPolicyCheck(w protocol.Workload) (reason, code string) {
+	spec, ok := a.o.Policy.Tasks[w.Task]
+	if !ok {
+		return fmt.Sprintf("task %q is not declared in this host's policy", w.Task), codeRefusedPolicy
+	}
+	params, err := taskParams(w.Params)
+	if err == nil {
+		err = spec.CheckParams(params)
+	}
+	if err != nil {
+		return fmt.Sprintf("task %s: %v", w.Task, err), codeRefusedPolicy
+	}
+	if a.hostActive() >= a.hostSlots() {
+		return "no free host slot", codeRefusedCapacity
+	}
+	if spec.MaxConcurrent > 0 && a.activeTask(w.Task) >= spec.MaxConcurrent {
+		return fmt.Sprintf("task %s already has %d runs, the most allowed", w.Task, spec.MaxConcurrent), codeRefusedCapacity
+	}
+	return "", ""
+}
+
+// taskParams turns the parameters of a request into a map, refusing one named twice.
+func taskParams(list []protocol.TaskParam) (map[string]string, error) {
+	out := make(map[string]string, len(list))
+	for _, p := range list {
+		if _, dup := out[p.Key]; dup {
+			return nil, fmt.Errorf("parameter %s is given twice", p.Key)
+		}
+		out[p.Key] = p.Value
+	}
+	return out, nil
+}
+
+// taskScript is the entry command of a task: the owner's command, each word quoted so that
+// the shell the executor runs passes it on exactly as written.
+func taskScript(command []string) string {
+	words := make([]string, len(command))
+	for i, w := range command {
+		words[i] = "'" + strings.ReplaceAll(w, "'", `'\''`) + "'"
+	}
+	return "exec " + strings.Join(words, " ") + "\n"
+}
+
+// executeTask runs a declared task on the host itself, in a directory made for it and gone
+// afterwards. The run ends at the sooner of the owner's time limit and the request's.
+func (a *Agent) executeTask(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
+	spec := a.o.Policy.Tasks[m.Workload.Task]
+	params, _ := taskParams(m.Workload.Params)
+	env := []string{"MCC_TASK=" + m.Workload.Task}
+	for k, v := range params {
+		env = append(env, "MCC_PARAM_"+k+"="+v)
+	}
+	slices.Sort(env)
+
+	ex := a.o.HostExecutor
+	h, err := ex.Start(ctx, m.AssignmentID, protocol.ImageSpec{}, executor.StartOptions{})
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := ex.Stop(stopCtx, h); err != nil {
+			lg.Error("cleaning up after the task failed", "name", h.Name, "err", err)
+		}
+	}()
+	if err != nil {
+		return false, fmt.Sprintf("preparing the task's directory: %v", err)
+	}
+
+	limit := spec.Timeout()
+	if t := time.Duration(m.Workload.TimeoutSeconds) * time.Second; t > 0 && t < limit {
+		limit = t
+	}
+	tctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	go func() {
+		sc := bufio.NewScanner(pr)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			lg.Debug("task", "line", sc.Text())
+		}
+		// A line too long to scan must not block the task on a full pipe.
+		_, _ = io.Copy(io.Discard, pr)
+	}()
+
+	a.setState(as.id, protocol.AgentAssignmentStateRunning, "")
+	code, err := ex.Exec(tctx, h, executor.Command{Script: taskScript(spec.Command), Env: env, Output: pw})
+	pw.Close()
+
+	switch {
+	case a.stopReason(as) != "":
+		a.setOutcome(as, codeStopped, 0)
+		return false, a.stopReason(as)
+	case tctx.Err() == context.DeadlineExceeded:
+		a.setOutcome(as, codeTimeout, 0)
+		return false, fmt.Sprintf("stopped after its time limit of %s", limit)
+	case err != nil:
+		return false, fmt.Sprintf("running task: %v", err)
+	}
+	// It ran to an exit. That is "finished" whatever the exit code, which goes with it.
+	a.setOutcome(as, "", code)
+	if code != 0 {
+		return true, fmt.Sprintf("exited with code %d", code)
+	}
+	return true, ""
+}
+
+// setOutcome records how a task ended, to go out with its last status.
+func (a *Agent) setOutcome(as *assignment, code string, exitCode int) {
+	a.mu.Lock()
+	as.code, as.exitCode = code, exitCode
+	a.mu.Unlock()
+}
+
+// runnerSettings is what the agent reads of a just-in-time runner configuration.
+type runnerSettings struct {
+	// GitHubURL is the repository or organization the runner registers with.
+	GitHubURL  string `json:"gitHubUrl"`
+	WorkFolder string `json:"workFolder"`
+}
+
+// jitRunner reads the runner's settings from a just-in-time runner configuration: base64 JSON
+// mapping runner file names to base64 file contents.
+func jitRunner(encoded string) (runnerSettings, error) {
+	var settings runnerSettings
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return "", err
+		return settings, err
 	}
 	var files map[string]string
 	if err := json.Unmarshal(raw, &files); err != nil {
-		return "", err
+		return settings, err
 	}
 	runner, err := base64.StdEncoding.DecodeString(files[".runner"])
 	if err != nil {
-		return "", err
-	}
-	var settings struct {
-		GitHubURL string `json:"gitHubUrl"`
+		return settings, err
 	}
 	if err := json.Unmarshal([]byte(strings.TrimPrefix(string(runner), "\uFEFF")), &settings); err != nil {
-		return "", err
+		return settings, err
 	}
 	if settings.GitHubURL == "" {
-		return "", fmt.Errorf("no gitHubUrl")
+		return settings, fmt.Errorf("no gitHubUrl")
 	}
-	return settings.GitHubURL, nil
+	return settings, nil
 }
 
 // jobCache is the cache directory for the repository or organization this job's runner
 // registers with.
 func (a *Agent) jobCache(m protocol.Start) (string, func(), error) {
-	u, err := jitGitHubURL(m.Workload.JITConfig)
+	r, err := jitRunner(m.Workload.JITConfig)
 	if err != nil {
 		return "", nil, fmt.Errorf("could not read the runner configuration to choose a cache: %w", err)
 	}
-	return a.o.Cache.Acquire(u)
+	return a.o.Cache.Acquire(r.GitHubURL)
 }
 
 func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
@@ -186,14 +386,22 @@ func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
 	}
 	a.mu.Unlock()
 
-	if reason := a.policyCheck(m); reason != "" {
+	if reason, code := a.policyCheck(m); reason != "" {
 		a.log.Warn("refusing start", "assignment", m.AssignmentID, "reason", reason)
-		a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: " + reason})
+		a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: " + reason, Code: code})
 		return
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
-	as := &assignment{id: m.AssignmentID, platform: guestPlatform(m.Image), state: protocol.AgentAssignmentStateStarting, cancel: cancel}
+	as := &assignment{id: m.AssignmentID, state: protocol.AgentAssignmentStateStarting, cancel: cancel}
+	if m.Isolation == protocol.IsolationHost {
+		as.host = true
+		if m.Workload.Kind == workloadTask {
+			as.task = m.Workload.Task
+		}
+	} else {
+		as.platform = guestPlatform(m.Image)
+	}
 	a.mu.Lock()
 	a.assignments[m.AssignmentID] = as
 	a.mu.Unlock()
@@ -228,16 +436,81 @@ func (a *Agent) stopReason(as *assignment) string {
 }
 
 // runAssignment runs one assignment to completion. The final status is sent only after the
-// VM has been deleted.
+// VM has been deleted, or the work's directory on the host.
 func (a *Agent) runAssignment(ctx context.Context, as *assignment, m protocol.Start) {
-	lg := a.log.With("assignment", m.AssignmentID, "image", m.Image.Name)
+	lg := a.log.With("assignment", m.AssignmentID)
+	if as.host {
+		lg = lg.With("isolation", "host")
+	} else {
+		lg = lg.With("image", m.Image.Name)
+	}
 	a.setState(as.id, protocol.AgentAssignmentStateStarting, "")
 	if a.o.Policy.StayAwakeEnabled() {
 		a.awake.Acquire()
 		defer a.awake.Release()
 	}
-	ok, reason := a.execute(ctx, as, m, lg)
+	var ok bool
+	var reason string
+	if as.task != "" {
+		lg = lg.With("task", as.task)
+		ok, reason = a.executeTask(ctx, as, m, lg)
+	} else if as.host {
+		ok, reason = a.executeOnHost(ctx, as, m, lg)
+	} else {
+		ok, reason = a.execute(ctx, as, m, lg)
+	}
 	a.finish(as, lg, ok, reason)
+}
+
+// executeOnHost runs a runner on the host itself: in a directory made for it, holding a copy
+// of the host's runner, both gone afterwards.
+func (a *Agent) executeOnHost(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
+	ex := a.o.HostExecutor
+	runner := a.hostRunner()
+	if runner == "" {
+		return false, "this host has no Actions runner yet"
+	}
+	opts := executor.StartOptions{SharedDirs: map[string]executor.SharedDir{runnerShare: {Path: runner}}}
+	if a.o.Policy.HostTasks.Persistent() {
+		// The runner is new for every job; only its work folder is kept, for the repository or
+		// organization the runner registers with and no one else. Downloaded actions and
+		// temporary files are not kept: the next job would run a cached action as it found it.
+		r, err := jitRunner(m.Workload.JITConfig)
+		if err != nil {
+			return false, "could not read the runner configuration to choose a workspace"
+		}
+		opts.KeptDirs = []executor.KeptDir{{
+			Link: runnerShare + "/_work",
+			Key:  strings.TrimPrefix(strings.ToLower(r.GitHubURL), "https://"),
+			Wipe: []string{"_actions", "_temp"},
+		}}
+	}
+	var env []string
+	if a.o.Cache != nil {
+		if dir, release, err := a.jobCache(m); err != nil {
+			lg.Warn("running without a cache", "err", err)
+		} else {
+			env = append(env, "MCC_CACHE_DIR="+dir)
+			defer func() {
+				release()
+				go a.o.Cache.Prune()
+			}()
+		}
+	}
+	h, err := ex.Start(ctx, m.AssignmentID, protocol.ImageSpec{}, opts)
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := ex.Stop(stopCtx, h); err != nil {
+			lg.Error("cleaning up after the work failed", "name", h.Name, "err", err)
+		} else {
+			lg.Info("work directory deleted", "name", h.Name)
+		}
+	}()
+	if err != nil {
+		return false, fmt.Sprintf("preparing the work's directory: %v", err)
+	}
+	return a.runRunner(ctx, as, m, lg, ex, h, hostRunnerScript, env)
 }
 
 func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
@@ -292,6 +565,12 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 	}()
 	lg.Info("VM started", "vm", h.Name, "boot", time.Since(started).Round(time.Millisecond))
 
+	return a.runRunner(ctx, as, m, lg, a.o.Executor, h, entryScript(m.Image), nil)
+}
+
+// runRunner runs the runner's entry command where the executor has made room for it, and
+// watches its output for the job being taken.
+func (a *Agent) runRunner(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger, ex executor.Executor, h executor.Handle, script string, env []string) (bool, string) {
 	var busy atomic.Bool
 	pr, pw := io.Pipe()
 	go func() {
@@ -319,8 +598,9 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 	}
 
 	a.setState(as.id, protocol.AgentAssignmentStateRunning, "")
-	code, err := a.o.Executor.Exec(ctx, h, executor.Command{
-		Script: entryScript(m.Image),
+	code, err := ex.Exec(ctx, h, executor.Command{
+		Script: script,
+		Env:    env,
 		Stdin:  strings.NewReader(m.Workload.JITConfig + "\n"),
 		Output: pw,
 	})

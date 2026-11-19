@@ -122,6 +122,126 @@ type Policy struct {
 	// CacheMaxGB is the size above which the least recently used caches are deleted. Zero
 	// means no limit.
 	CacheMaxGB int `json:"cache_max_gb"`
+	// HostTasks lets work run on this host itself, without a virtual machine. Off unless the
+	// owner turns it on: such work is not isolated from the host.
+	HostTasks HostTasks `json:"host_tasks"`
+	// Tasks are commands the control plane may ask this host to run, by name. The owner writes
+	// each command here; a request can only choose one and give values for the parameters it
+	// declares. They run on the host itself, so they need host_tasks.
+	Tasks map[string]Task `json:"tasks"`
+}
+
+// Task is one command the owner lets the control plane ask for.
+type Task struct {
+	// Command is the program and its arguments, run as written: no shell reads it. The program
+	// is named by its full path.
+	Command []string `json:"command"`
+	// Params are the parameters a request may set, each with the pattern its value must match
+	// in full. A request that sets anything else is refused. The command finds a value in the
+	// environment variable MCC_PARAM_<NAME>, and never on its command line.
+	Params map[string]string `json:"params"`
+	// TimeoutSeconds is the longest it may run. Zero means an hour.
+	TimeoutSeconds int `json:"timeout_seconds"`
+	// MaxConcurrent is how many runs of it there may be at once. Zero means as many as
+	// host_tasks.max allows.
+	MaxConcurrent int `json:"max_concurrent"`
+}
+
+// Timeout is the longest the task may run.
+func (t Task) Timeout() time.Duration {
+	if t.TimeoutSeconds <= 0 {
+		return time.Hour
+	}
+	return time.Duration(t.TimeoutSeconds) * time.Second
+}
+
+var (
+	taskName  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	paramName = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,39}$`)
+)
+
+// paramPattern compiles a parameter's pattern so that it must match the whole value.
+func paramPattern(p string) (*regexp.Regexp, error) {
+	return regexp.Compile(`\A(?:` + p + `)\z`)
+}
+
+// CheckParams says why a request's parameters are not ones the owner allows, or nil.
+func (t Task) CheckParams(params map[string]string) error {
+	for k, v := range params {
+		pattern, ok := t.Params[k]
+		if !ok {
+			return fmt.Errorf("the task has no parameter %s", k)
+		}
+		re, err := paramPattern(pattern)
+		if err != nil || !re.MatchString(v) {
+			return fmt.Errorf("the value of %s is not one the task allows", k)
+		}
+	}
+	return nil
+}
+
+func (p Policy) validateTasks() error {
+	if len(p.Tasks) > 0 && !p.HostTasks.Enabled {
+		return fmt.Errorf("policy: tasks run on the host itself, so they need host_tasks")
+	}
+	for name, t := range p.Tasks {
+		if !taskName.MatchString(name) {
+			return fmt.Errorf("policy: tasks: %q is not a task name", name)
+		}
+		if len(t.Command) == 0 || !filepath.IsAbs(t.Command[0]) {
+			return fmt.Errorf("policy: tasks.%s.command must start with the full path of a program", name)
+		}
+		for _, arg := range t.Command {
+			if strings.ContainsRune(arg, 0) {
+				return fmt.Errorf("policy: tasks.%s.command has an argument that cannot be passed to a program", name)
+			}
+		}
+		for k, pattern := range t.Params {
+			if !paramName.MatchString(k) {
+				return fmt.Errorf("policy: tasks.%s.params: %q must be upper-case letters, digits and _", name, k)
+			}
+			if _, err := paramPattern(pattern); err != nil {
+				return fmt.Errorf("policy: tasks.%s.params.%s: %w", name, k, err)
+			}
+		}
+		if t.TimeoutSeconds < 0 || t.MaxConcurrent < 0 {
+			return fmt.Errorf("policy: tasks.%s: timeout_seconds and max_concurrent must not be negative", name)
+		}
+	}
+	return nil
+}
+
+// HostTasks is the owner's say on work that runs on the host itself.
+type HostTasks struct {
+	Enabled bool `json:"enabled"`
+	// Max is how much such work runs at once. Zero means one.
+	Max int `json:"max"`
+	// Dir is where each piece of work gets its directory. Empty means work/ in the agent's own
+	// directory. With User set it must be a directory that user can write to.
+	Dir string `json:"dir"`
+	// Workspace is "fresh" (the default): a new directory for each piece of work, deleted
+	// afterwards. "persistent" keeps a GitHub job's checkouts and tool downloads between jobs
+	// of the same repository or organization, so that later jobs start warm. Jobs that share
+	// them can affect one another.
+	Workspace string `json:"workspace"`
+	// GitHubRunner lets GitHub Actions jobs run on the host. A workflow is arbitrary code, so
+	// this needs its own yes, and allowed_github_urls must say whose workflows.
+	GitHubRunner bool `json:"github_runner"`
+	// User is the account work runs as, entered with sudo. The agent's own account can read
+	// the agent's key and edit this policy, so work only runs as it if AllowSameUser says so.
+	User          string `json:"user"`
+	AllowSameUser bool   `json:"allow_same_user"`
+}
+
+// Persistent reports whether work keeps its directories between runs.
+func (h HostTasks) Persistent() bool { return h.Workspace == "persistent" }
+
+// Slots is how much work the host runs directly at once: zero unless enabled.
+func (h HostTasks) Slots() int {
+	if !h.Enabled {
+		return 0
+	}
+	return max(1, h.Max)
 }
 
 func boolOr(p *bool, d bool) bool {
@@ -195,6 +315,42 @@ func (p Policy) Validate() error {
 	}
 	if p.CacheScope != "" && p.CacheScope != "runner" && p.CacheScope != "host" {
 		return fmt.Errorf("policy: cache_scope must be runner or host")
+	}
+	if err := p.HostTasks.validate(p); err != nil {
+		return err
+	}
+	return p.validateTasks()
+}
+
+// userName is the shape of an account name: it starts with a letter or underscore, so it can
+// never be read as an option to sudo.
+var userName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9._-]{0,31}$`)
+
+func (h HostTasks) validate(p Policy) error {
+	if !h.Enabled {
+		return nil
+	}
+	if h.Max < 0 {
+		return fmt.Errorf("policy: host_tasks.max must not be negative")
+	}
+	if h.Dir != "" && !filepath.IsAbs(h.Dir) {
+		return fmt.Errorf("policy: host_tasks.dir must be a full path")
+	}
+	if h.Workspace != "" && h.Workspace != "fresh" && h.Workspace != "persistent" {
+		return fmt.Errorf("policy: host_tasks.workspace must be fresh or persistent")
+	}
+	switch {
+	case h.User != "" && h.AllowSameUser:
+		return fmt.Errorf("policy: host_tasks has both user and allow_same_user; choose one")
+	case h.User == "" && !h.AllowSameUser:
+		return fmt.Errorf("policy: host_tasks needs user, the account work runs as, or allow_same_user to run it as the agent's own account, which can read the agent's key and change this policy")
+	case h.User != "" && !userName.MatchString(h.User):
+		return fmt.Errorf("policy: host_tasks.user %q is not an account name", h.User)
+	case h.User != "" && h.Dir == "":
+		return fmt.Errorf("policy: host_tasks.dir is needed with host_tasks.user: a directory that user can write to")
+	}
+	if h.GitHubRunner && len(p.AllowedGitHubURLs) == 0 {
+		return fmt.Errorf("policy: host_tasks.github_runner needs allowed_github_urls, to say whose workflows may run on this host")
 	}
 	return nil
 }

@@ -1,5 +1,6 @@
-// Package executor is the agent's interface to virtualization. Adding a platform is adding an
-// implementation; the agent core does not know about Tart.
+// Package executor is the agent's interface to whatever runs work: a virtual machine made for
+// it, or a process on the host itself. Adding a platform is adding an implementation; the agent
+// core does not know about Tart.
 package executor
 
 import (
@@ -38,12 +39,31 @@ type StartOptions struct {
 	IsolateNetwork bool
 	// SharedDirs maps a share name to a host directory mounted in the guest.
 	SharedDirs map[string]SharedDir
+	// KeptDirs are directories that outlive the work, for an executor that runs work on the
+	// host itself. A VM has nothing of the kind.
+	KeptDirs []KeptDir
+}
+
+// KeptDir is a directory work finds where it left it last time: checkouts and build output
+// that make the next run faster. Whoever shares a Key shares what is in it, so a Key is as
+// narrow as the trust between the pieces of work that use it.
+type KeptDir struct {
+	// Link is where the work finds the directory, relative to its own.
+	Link string
+	// Key names whose directory it is. Two pieces of work with one Key never have the same
+	// directory at the same time; the second gets another.
+	Key string
+	// Wipe are entries deleted from it before and after each piece of work.
+	Wipe []string
 }
 
 // Command is the workload's entry command. Agents build it from a fixed template per workload
 // kind; the control plane never supplies a command.
 type Command struct {
 	Script string
+	// Env is extra environment for the command, as KEY=value. Only an executor that runs work
+	// on the host itself sets it; a guest's environment is its image's business.
+	Env []string
 	// Stdin carries secrets such as the runner configuration, so they never appear in process
 	// arguments on the host.
 	Stdin  io.Reader

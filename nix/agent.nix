@@ -8,7 +8,7 @@ buildGoModule {
   pname = "mcc-agent";
   inherit version;
   src = lib.cleanSource ../agent;
-  vendorHash = "sha256-7JqwcenKhaOgziXfkl32qz2VrZ0zKhNJMLfvHto/Pco=";
+  vendorHash = "sha256-UCn60zreYDR5yiaFUq/2hLIwJZyKLaDbDYDXIOKGglY=";
   subPackages = [ "cmd/mcc" ];
   ldflags = [
     "-s"

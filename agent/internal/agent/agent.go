@@ -1,6 +1,7 @@
 // Package agent is the MCC agent: it holds one outbound connection to the control plane,
-// reports capacity, prepares images, and runs each assignment in its own VM through an
-// executor. Local policy is enforced here, and the control plane cannot override it.
+// reports capacity, prepares images, and runs each assignment through an executor: in its own
+// VM, or on the host itself where the owner allows that. Local policy is enforced here, and
+// the control plane cannot override it.
 package agent
 
 import (
@@ -49,7 +50,9 @@ type Options struct {
 	Identity  *identity.Identity
 	Policy    config.Policy
 	Executor  executor.Executor
-	Runner    RunnerSource
+	// HostExecutor runs work on the host itself. Nil unless the owner's policy allows that.
+	HostExecutor executor.Executor
+	Runner       RunnerSource
 	// Cache is nil when the owner has not set a cache directory.
 	Cache     CacheSource
 	Log       *slog.Logger
@@ -64,8 +67,15 @@ type assignment struct {
 	id string
 	// platform is the guest platform of the assignment's image.
 	platform string
-	state    protocol.AgentAssignmentState
-	reason   string
+	// host is true for work that runs on the host itself; it has no image and no platform.
+	host bool
+	// task is the name of the task it runs, if it runs one.
+	task   string
+	state  protocol.AgentAssignmentState
+	reason string
+	// code and exitCode say how it ended, for the control plane: see protocol.Status.
+	code     string
+	exitCode int
 	cancel   context.CancelFunc
 	// stopReason is set when the control plane asked us to stop.
 	stopReason string
@@ -155,15 +165,20 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) cleanupLeftovers(ctx context.Context) {
-	left, err := a.o.Executor.List(ctx)
-	if err != nil {
-		a.log.Warn("could not list leftover VMs", "err", err)
-		return
-	}
-	for _, h := range left {
-		a.log.Info("deleting VM left from a previous run", "vm", h.Name)
-		if err := a.o.Executor.Stop(ctx, h); err != nil {
-			a.log.Warn("deleting leftover VM failed", "vm", h.Name, "err", err)
+	for _, ex := range []executor.Executor{a.o.Executor, a.o.HostExecutor} {
+		if ex == nil {
+			continue
+		}
+		left, err := ex.List(ctx)
+		if err != nil {
+			a.log.Warn("could not list work left from a previous run", "err", err)
+			continue
+		}
+		for _, h := range left {
+			a.log.Info("cleaning up work left from a previous run", "name", h.Name)
+			if err := ex.Stop(ctx, h); err != nil {
+				a.log.Warn("cleaning up leftover work failed", "name", h.Name, "err", err)
+			}
 		}
 	}
 }
@@ -397,7 +412,7 @@ func (a *Agent) reports() []protocol.AssignmentReport {
 	defer a.mu.Unlock()
 	out := make([]protocol.AssignmentReport, 0, len(a.assignments))
 	for _, as := range a.assignments {
-		out = append(out, protocol.AssignmentReport{AssignmentID: as.id, State: as.state, Reason: as.reason})
+		out = append(out, protocol.AssignmentReport{AssignmentID: as.id, State: as.state, Reason: as.reason, Code: as.code, ExitCode: as.exitCode})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].AssignmentID < out[j].AssignmentID })
 	return out
@@ -411,8 +426,12 @@ func (a *Agent) setState(id string, s protocol.AgentAssignmentState, reason stri
 		return
 	}
 	as.state, as.reason = s, reason
+	st := &protocol.Status{Type: protocol.TypeStatus, AssignmentID: id, State: s, Reason: reason}
+	if isTerminal(s) {
+		st.Code, st.ExitCode = as.code, as.exitCode
+	}
 	a.mu.Unlock()
-	delivered := a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: id, State: s, Reason: reason})
+	delivered := a.send(st)
 	if isTerminal(s) {
 		a.mu.Lock()
 		if delivered {
@@ -460,16 +479,30 @@ func (a *Agent) activeOn(platform string) int {
 	return n
 }
 
-func (a *Agent) activeCount() int {
+// activeCount counts running VMs; hostActive counts work running on the host itself. The two
+// have separate limits.
+func (a *Agent) activeCount() int { return a.active(false) }
+func (a *Agent) hostActive() int  { return a.active(true) }
+
+func (a *Agent) active(host bool) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	n := 0
 	for _, as := range a.assignments {
-		if !isTerminal(as.state) {
+		if !isTerminal(as.state) && as.host == host {
 			n++
 		}
 	}
 	return n
+}
+
+// hostSlots is how much work this host runs directly at once: none unless the owner allows it,
+// and none where policy demands network isolation, which such work cannot have.
+func (a *Agent) hostSlots() int {
+	if a.o.HostExecutor == nil || a.o.Policy.RequireNetworkIsolation {
+		return 0
+	}
+	return a.o.Policy.HostTasks.Slots()
 }
 
 func (a *Agent) accepting() bool {
@@ -477,6 +510,51 @@ func (a *Agent) accepting() bool {
 		return false
 	}
 	return !(a.o.Policy.RequireNetworkIsolation && !a.isolationOK)
+}
+
+// freeHostSlots is zero until there is something the host can run: a runner to give a GitHub
+// job (unlike a VM, the host has no image with one in it to fall back on), or a task its owner
+// has declared.
+func (a *Agent) freeHostSlots() int {
+	if a.hostRunner() == "" && len(a.o.Policy.Tasks) == 0 {
+		return 0
+	}
+	return max(0, a.hostSlots()-a.hostActive())
+}
+
+// activeTask counts runs of one task.
+func (a *Agent) activeTask(name string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, as := range a.assignments {
+		if !isTerminal(as.state) && as.task == name {
+			n++
+		}
+	}
+	return n
+}
+
+// declaredTasks are the tasks the owner's policy declares, for the control plane to choose
+// hosts by. None on a host that runs no work itself.
+func (a *Agent) declaredTasks() []protocol.TaskCapacity {
+	if a.hostSlots() == 0 {
+		return nil
+	}
+	var out []protocol.TaskCapacity
+	for name, t := range a.o.Policy.Tasks {
+		out = append(out, protocol.TaskCapacity{Name: name, TimeoutSeconds: int(t.Timeout() / time.Second), MaxConcurrent: t.MaxConcurrent})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// hostRunner is the directory of the Actions runner built for this host's own system.
+func (a *Agent) hostRunner() string {
+	if a.o.Runner == nil {
+		return ""
+	}
+	return a.o.Runner.Current(runtime.GOOS)
 }
 
 func (a *Agent) sendCapacity() {
@@ -495,7 +573,10 @@ func (a *Agent) sendCapacity() {
 	for _, p := range a.o.Executor.GuestPlatforms() {
 		guests = append(guests, protocol.GuestCapacity{Platform: p, Limit: a.guestLimit(p)})
 	}
-	a.send(&protocol.Capacity{Type: protocol.TypeCapacity, SlotsTotal: total, SlotsFree: free, ImagesReady: ready, Accepting: a.accepting(), Guests: guests})
+	a.send(&protocol.Capacity{
+		Type: protocol.TypeCapacity, SlotsTotal: total, SlotsFree: free, ImagesReady: ready, Accepting: a.accepting(), Guests: guests,
+		HostSlotsTotal: a.hostSlots(), HostSlotsFree: a.freeHostSlots(), Tasks: a.declaredTasks(),
+	})
 }
 
 // applyConfig records the images the control plane wants and prepares those policy allows.

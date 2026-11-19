@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -31,6 +32,7 @@ import (
 	"github.com/my-compute-cloud/mcc/agent/internal/executor"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/fake"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/kvm"
+	"github.com/my-compute-cloud/mcc/agent/internal/executor/process"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/tart"
 	"github.com/my-compute-cloud/mcc/agent/internal/identity"
 	"github.com/my-compute-cloud/mcc/agent/internal/runnerbin"
@@ -159,10 +161,33 @@ func run(args []string) error {
 
 	// One Actions runner per guest platform this host can run: macOS and Linux guests each
 	// need their own build.
+	// Work on the host itself, where the owner allows it. It has no image to bring a runner,
+	// so GitHub jobs there need the runner built for this host's own system.
+	var hostEx executor.Executor
+	if policy.HostTasks.Enabled {
+		work := policy.HostTasks.Dir
+		if work == "" {
+			work = filepath.Join(dir, "work")
+		}
+		px := process.New(work, filepath.Join(dir, "host-jobs"), policy.HostTasks.User, log)
+		for _, problem := range px.Preflight(ctx) {
+			log.Warn("this host is not ready to run work without a VM", "problem", problem)
+		}
+		hostEx = px
+		log.Info("this host runs work without a VM", "dir", work, "user", policy.HostTasks.User, "at_once", policy.HostTasks.Slots())
+	}
+
 	var runners runnerSet
-	if policy.SharedRunnerEnabled() && os.Getenv("MCC_EXECUTOR") != "fake" {
+	var platforms []string
+	if policy.SharedRunnerEnabled() {
+		platforms = ex.GuestPlatforms()
+	}
+	if policy.HostTasks.Enabled && policy.HostTasks.GitHubRunner && !slices.Contains(platforms, runtime.GOOS) {
+		platforms = append(platforms, runtime.GOOS)
+	}
+	if len(platforms) > 0 && os.Getenv("MCC_EXECUTOR") != "fake" {
 		runners = runnerSet{}
-		for _, platform := range ex.GuestPlatforms() {
+		for _, platform := range platforms {
 			switch platform {
 			case "darwin":
 				runners[platform] = runnerbin.New(filepath.Join(dir, "runner"), "osx-"+runnerArch())
@@ -183,15 +208,16 @@ func run(args []string) error {
 	}
 
 	a := agent.New(agent.Options{
-		ServerURL: state.ServerURL,
-		HostID:    state.HostID,
-		Identity:  id,
-		Policy:    policy,
-		Executor:  ex,
-		Runner:    runnerSource(runners),
-		Cache:     jobCache,
-		Log:       log,
-		Resources: resources(policy),
+		ServerURL:    state.ServerURL,
+		HostID:       state.HostID,
+		Identity:     id,
+		Policy:       policy,
+		Executor:     ex,
+		HostExecutor: hostEx,
+		Runner:       runnerSource(runners),
+		Cache:        jobCache,
+		Log:          log,
+		Resources:    resources(policy),
 	})
 	log.Info("starting agent", "version", agent.Version, "host", state.HostID, "server", state.ServerURL)
 	return a.Run(ctx)

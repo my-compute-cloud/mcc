@@ -29,7 +29,9 @@
       "properties": {
         "assignment_id": { "type": "string" },
         "state": { "$ref": "#/$defs/AgentAssignmentState" },
-        "reason": { "type": "string" }
+        "reason": { "type": "string" },
+        "code": { "type": "string", "description": "Why it failed, for the control plane to act on: see Status.code" },
+        "exit_code": { "type": "integer", "description": "A task's exit code, when it ran to an exit. Absent means 0" }
       },
       "required": ["assignment_id", "state"]
     },
@@ -43,25 +45,53 @@
       },
       "required": ["name", "source", "platform"]
     },
+    "Isolation": {
+      "type": "string",
+      "description": "Where work runs: in a virtual machine made for it, or directly on the host. Absent means vm.",
+      "enum": ["vm", "host"]
+    },
     "PoolConfig": {
       "type": "object",
       "properties": {
         "name": { "type": "string" },
         "label": { "type": "string" },
-        "image": { "type": "string", "description": "ImageSpec.name" }
+        "image": { "type": "string", "description": "ImageSpec.name. Absent for a pool whose work runs on the host itself" },
+        "isolation": { "$ref": "#/$defs/Isolation" }
       },
-      "required": ["name", "label", "image"]
+      "required": ["name", "label"]
+    },
+    "TaskParam": {
+      "type": "object",
+      "description": "One parameter of a task. A list of these rather than an object, so that the generated types stay simple.",
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "string" }
+      },
+      "required": ["key", "value"]
+    },
+    "TaskCapacity": {
+      "type": "object",
+      "description": "A task the host's owner has declared in its policy. The control plane sends a task only to hosts that list it.",
+      "properties": {
+        "name": { "type": "string" },
+        "timeout_seconds": { "type": "integer", "description": "The longest the owner lets it run" },
+        "max_concurrent": { "type": "integer", "description": "Most runs of it at once; 0 means only the host's slots limit them" }
+      },
+      "required": ["name", "timeout_seconds"]
     },
     "Workload": {
       "type": "object",
-      "description": "What to run inside the VM. The agent maps kind to a fixed entry command; there is no free-form command.",
+      "description": "What to run. The agent maps kind to a fixed entry command, or for a task to the command its owner declared under that name; there is no free-form command.",
       "properties": {
-        "kind": { "type": "string", "enum": ["github-runner"] },
-        "runner_name": { "type": "string" },
-        "jit_config": { "type": "string", "description": "GitHub just-in-time runner configuration, single use" },
-        "idle_timeout_seconds": { "type": "integer", "description": "Stop the VM if the runner has not taken a job by then" }
+        "kind": { "type": "string", "enum": ["github-runner", "task"] },
+        "runner_name": { "type": "string", "description": "github-runner only" },
+        "jit_config": { "type": "string", "description": "github-runner only: GitHub just-in-time runner configuration, single use" },
+        "idle_timeout_seconds": { "type": "integer", "description": "github-runner only: stop the work if the runner has not taken a job by then" },
+        "task": { "type": "string", "description": "task only: the name of a task declared in the host's policy" },
+        "params": { "type": "array", "items": { "$ref": "#/$defs/TaskParam" }, "description": "task only: values for the parameters the task declares" },
+        "timeout_seconds": { "type": "integer", "description": "task only: stop it after this long, if that is sooner than the owner's own limit" }
       },
-      "required": ["kind", "runner_name", "jit_config"]
+      "required": ["kind"]
     },
 
     "Hello": {
@@ -90,7 +120,10 @@
           "type": "array",
           "items": { "$ref": "#/$defs/GuestCapacity" },
           "description": "Guest platforms this host can run. Absent from agents that only run macOS guests"
-        }
+        },
+        "host_slots_total": { "type": "integer", "description": "How much work this host runs directly, without a VM, at once. Absent or 0 unless its owner allows that" },
+        "host_slots_free": { "type": "integer" },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/TaskCapacity" }, "description": "Tasks this host's owner has declared. Absent if none" }
       },
       "required": ["slots_total", "slots_free", "images_ready", "accepting"]
     },
@@ -109,7 +142,9 @@
       "properties": {
         "assignment_id": { "type": "string" },
         "state": { "$ref": "#/$defs/AgentAssignmentState" },
-        "reason": { "type": "string" }
+        "reason": { "type": "string" },
+        "code": { "type": "string", "description": "Why it failed, for the control plane to act on: refused_policy (the host's own rules forbid it; trying again will not help), refused_capacity (no room just now), timeout (a task ran past its limit) or stopped (a task was stopped before it ended). Absent otherwise" },
+        "exit_code": { "type": "integer", "description": "A task's exit code, when it ran to an exit. Absent means 0" }
       },
       "required": ["assignment_id", "state"]
     },
@@ -155,10 +190,11 @@
       "x-message": "start",
       "properties": {
         "assignment_id": { "type": "string" },
-        "image": { "$ref": "#/$defs/ImageSpec" },
+        "isolation": { "$ref": "#/$defs/Isolation" },
+        "image": { "$ref": "#/$defs/ImageSpec", "description": "The VM's image. Absent when isolation is host" },
         "workload": { "$ref": "#/$defs/Workload" }
       },
-      "required": ["assignment_id", "image", "workload"]
+      "required": ["assignment_id", "workload"]
     },
     "Stop": {
       "type": "object",

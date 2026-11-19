@@ -395,11 +395,11 @@ func TestJobsGetTheirRepositorysCache(t *testing.T) {
 func TestJITGitHubURL(t *testing.T) {
 	runner := base64.StdEncoding.EncodeToString([]byte("\uFEFF" + `{"agentName":"x","gitHubUrl":"https://github.com/acme/builds"}`))
 	files, _ := json.Marshal(map[string]string{".runner": runner, ".credentials": "e30="})
-	u, err := jitGitHubURL(base64.StdEncoding.EncodeToString(files))
-	if err != nil || u != "https://github.com/acme/builds" {
-		t.Fatalf("got %q %v", u, err)
+	r, err := jitRunner(base64.StdEncoding.EncodeToString(files))
+	if err != nil || r.GitHubURL != "https://github.com/acme/builds" {
+		t.Fatalf("got %+v %v", r, err)
 	}
-	if _, err := jitGitHubURL("not base64!"); err == nil {
+	if _, err := jitRunner("not base64!"); err == nil {
 		t.Fatal("expected error")
 	}
 }
