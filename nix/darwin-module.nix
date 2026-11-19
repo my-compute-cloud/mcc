@@ -19,7 +19,11 @@ let
   home = "/Users/${cfg.user}";
   policyFile = pkgs.writeText "mcc-policy.json" (builtins.toJSON cfg.policy);
 
-  start = pkgs.writeShellScript "mcc-agent-start" ''
+  # The service's program. macOS shows the name of this file to the user, in the "can run in
+  # the background" notice and in Login Items, so it is a file called mcc-agent, and launchd is
+  # pointed at it through the system profile: a path that stays the same from one version to
+  # the next, where a store path would put a hash in front of the user and change every time.
+  start = pkgs.writeShellScriptBin "mcc-agent" ''
     set -euo pipefail
     export PATH=${
       lib.makeBinPath [
@@ -90,10 +94,16 @@ in
       }
     ];
 
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [
+      cfg.package
+      start
+    ];
 
     launchd.user.agents.mcc-agent.serviceConfig = {
-      ProgramArguments = [ "${start}" ];
+      ProgramArguments = [ "/run/current-system/sw/bin/mcc-agent" ];
+      # The path above no longer changes with the version, so this does: nix-darwin restarts
+      # an agent whose definition changed, and a new agent should replace the old one.
+      EnvironmentVariables.MCC_AGENT_BUILD = "${start}";
       RunAtLoad = true;
       KeepAlive.SuccessfulExit = false;
       ThrottleInterval = 30;
