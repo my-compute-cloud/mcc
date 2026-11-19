@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -129,6 +130,75 @@ type Policy struct {
 	// each command here; a request can only choose one and give values for the parameters it
 	// declares. They run on the host itself, so they need host_tasks.
 	Tasks map[string]Task `json:"tasks"`
+	// AllowedWorkloads are the kinds of work this host takes from the control plane:
+	// "github-runner", and "script", a shell script the caller wrote, which runs only inside a
+	// VM. Empty means GitHub runners only, so that a newer agent never does more than the one
+	// before it unless the owner says so. Declared tasks need no entry: declaring one is the yes.
+	AllowedWorkloads []string `json:"allowed_workloads"`
+	// ScriptTimeoutSeconds is the longest a script may run. Zero means an hour.
+	ScriptTimeoutSeconds int `json:"script_timeout_seconds"`
+	// TaskOutput is how much of what tasks print is kept on this host, and for how long.
+	TaskOutput TaskOutput `json:"task_output"`
+}
+
+// TaskOutput limits the output kept of tasks. Zero values mean the defaults.
+type TaskOutput struct {
+	// MaxMB is the most kept of one run. What a task prints beyond it is dropped. Default 64.
+	MaxMB int `json:"max_mb"`
+	// TotalMB is the most kept of all runs together; the oldest go first. Default 1024.
+	TotalMB int `json:"total_mb"`
+	// KeepDays is how long a run's output is kept after it ends. Default 7.
+	KeepDays int `json:"keep_days"`
+	// Upload lets this host send a finished task's output to the control plane, where the
+	// tenant's plan keeps it for a time. Off by default: it is the one way output leaves the
+	// host in a form the control plane can read.
+	Upload bool `json:"upload"`
+	// Listen is an address, such as "0.0.0.0:7443", on which this host gives a task's output
+	// to whoever shows that task's secret. Empty, the default, means the host accepts no
+	// connections at all and output is read on the host itself.
+	Listen string `json:"listen"`
+	// Address is the host:port callers are told to connect to, when it is not what Listen
+	// says: a name others can resolve, or the outside of a port forward.
+	Address string `json:"address"`
+}
+
+// Reachable is the host:port callers are told to connect to, or "" if the host does not listen.
+func (o TaskOutput) Reachable() string {
+	if o.Listen == "" {
+		return ""
+	}
+	if o.Address != "" {
+		return o.Address
+	}
+	host, port, err := net.SplitHostPort(o.Listen)
+	if err != nil {
+		return ""
+	}
+	// An address that means "every interface" is not one to connect to.
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		if name, err := os.Hostname(); err == nil {
+			host = name
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func (o TaskOutput) validate() error {
+	if o.MaxMB < 0 || o.TotalMB < 0 || o.KeepDays < 0 {
+		return fmt.Errorf("policy: task_output values must not be negative")
+	}
+	for name, v := range map[string]string{"listen": o.Listen, "address": o.Address} {
+		if v == "" {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(v); err != nil || port == "" {
+			return fmt.Errorf("policy: task_output.%s must be host:port", name)
+		}
+	}
+	if o.Address != "" && o.Listen == "" {
+		return fmt.Errorf("policy: task_output.address means nothing without task_output.listen")
+	}
+	return nil
 }
 
 // Task is one command the owner lets the control plane ask for.
@@ -145,6 +215,27 @@ type Task struct {
 	// MaxConcurrent is how many runs of it there may be at once. Zero means as many as
 	// host_tasks.max allows.
 	MaxConcurrent int `json:"max_concurrent"`
+}
+
+// WorkloadAllowed reports whether the owner lets this kind of work run here.
+func (p Policy) WorkloadAllowed(kind string) bool {
+	if len(p.AllowedWorkloads) == 0 {
+		return kind == "github-runner"
+	}
+	for _, k := range p.AllowedWorkloads {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// ScriptTimeout is the longest a script may run.
+func (p Policy) ScriptTimeout() time.Duration {
+	if p.ScriptTimeoutSeconds <= 0 {
+		return time.Hour
+	}
+	return time.Duration(p.ScriptTimeoutSeconds) * time.Second
 }
 
 // Timeout is the longest the task may run.
@@ -318,6 +409,17 @@ func (p Policy) Validate() error {
 	}
 	if err := p.HostTasks.validate(p); err != nil {
 		return err
+	}
+	if err := p.TaskOutput.validate(); err != nil {
+		return err
+	}
+	for _, k := range p.AllowedWorkloads {
+		if k != "github-runner" && k != "script" {
+			return fmt.Errorf("policy: allowed_workloads %q is not github-runner or script", k)
+		}
+	}
+	if p.ScriptTimeoutSeconds < 0 {
+		return fmt.Errorf("policy: script_timeout_seconds must not be negative")
 	}
 	return p.validateTasks()
 }

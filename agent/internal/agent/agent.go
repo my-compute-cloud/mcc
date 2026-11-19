@@ -6,6 +6,7 @@ package agent
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"github.com/my-compute-cloud/mcc/agent/internal/identity"
 	"github.com/my-compute-cloud/mcc/agent/internal/power"
 	"github.com/my-compute-cloud/mcc/agent/internal/protocol"
+	"github.com/my-compute-cloud/mcc/agent/internal/tasklog"
 )
 
 // Version is set at build time with -ldflags.
@@ -54,7 +56,15 @@ type Options struct {
 	HostExecutor executor.Executor
 	Runner       RunnerSource
 	// Cache is nil when the owner has not set a cache directory.
-	Cache     CacheSource
+	Cache CacheSource
+	// TaskOutput keeps what tasks print. Nil keeps nothing.
+	TaskOutput *tasklog.Store
+	// OutputAddress and OutputPin are where callers on other machines read a task's output
+	// from this host, and the key they will find there. Empty unless the owner turned that on.
+	OutputAddress, OutputPin string
+	// OutputKey is the key of this host's output listener. With it, a caller can also read a
+	// task's output through the control plane, sealed so that only the caller can read it.
+	OutputKey *ecdsa.PrivateKey
 	Log       *slog.Logger
 	Resources executor.Resources
 	// Now is the clock used for active hours (tests override it).
@@ -70,7 +80,9 @@ type assignment struct {
 	// host is true for work that runs on the host itself; it has no image and no platform.
 	host bool
 	// task is the name of the task it runs, if it runs one.
-	task   string
+	task string
+	// script is true for a caller's script, which runs in a VM.
+	script bool
 	state  protocol.AgentAssignmentState
 	reason string
 	// code and exitCode say how it ended, for the control plane: see protocol.Status.
@@ -97,6 +109,7 @@ type Agent struct {
 	connCtx     context.Context
 	wg          sync.WaitGroup
 	isolationOK bool
+	streams     streams
 }
 
 func New(o Options) *Agent {
@@ -307,6 +320,17 @@ func (a *Agent) session(ctx context.Context) error {
 			if err := json.Unmarshal(raw, &m); err == nil {
 				a.handleStop(m)
 			}
+		case protocol.TypeAttach:
+			var m protocol.Attach
+			if err := json.Unmarshal(raw, &m); err == nil {
+				// Tied to this connection: a stream ends when the connection that carries it does.
+				a.handleAttach(sctx, m)
+			}
+		case protocol.TypeDetach:
+			var m protocol.Detach
+			if err := json.Unmarshal(raw, &m); err == nil {
+				a.handleDetach(m)
+			}
 		case protocol.TypeConfig:
 			var m protocol.Config
 			if err := json.Unmarshal(raw, &m); err == nil {
@@ -349,6 +373,8 @@ func envelope(m any) {
 	case *protocol.Status:
 		v.V, v.ID = 1, newID()
 	case *protocol.Heartbeat:
+		v.V, v.ID = 1, newID()
+	case *protocol.Output:
 		v.V, v.ID = 1, newID()
 	}
 }
@@ -549,6 +575,18 @@ func (a *Agent) declaredTasks() []protocol.TaskCapacity {
 	return out
 }
 
+// outputKey is the public half of the host's output key, as callers are given it.
+func (a *Agent) outputKey() string {
+	if a.o.OutputKey == nil || a.o.TaskOutput == nil {
+		return ""
+	}
+	k, err := tasklog.PublicKey(a.o.OutputKey)
+	if err != nil {
+		return ""
+	}
+	return k
+}
+
 // hostRunner is the directory of the Actions runner built for this host's own system.
 func (a *Agent) hostRunner() string {
 	if a.o.Runner == nil {
@@ -576,6 +614,8 @@ func (a *Agent) sendCapacity() {
 	a.send(&protocol.Capacity{
 		Type: protocol.TypeCapacity, SlotsTotal: total, SlotsFree: free, ImagesReady: ready, Accepting: a.accepting(), Guests: guests,
 		HostSlotsTotal: a.hostSlots(), HostSlotsFree: a.freeHostSlots(), Tasks: a.declaredTasks(),
+		OutputAddress: a.o.OutputAddress, OutputPin: a.o.OutputPin, OutputKey: a.outputKey(),
+		Scripts: a.o.Policy.WorkloadAllowed("script"),
 	})
 }
 

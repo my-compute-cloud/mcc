@@ -71,3 +71,10 @@ func (i *Identity) SignHello(nonce, hostID string) string {
 	msg := []byte("mcc-hello\n" + nonce + "\n" + hostID)
 	return base64.StdEncoding.EncodeToString(ed25519.Sign(i.priv, msg))
 }
+
+// SignUpload signs a task's output for the control plane to keep: when, by which host, for
+// which task, and the SHA-256 of the bytes, in hex.
+func (i *Identity) SignUpload(timestamp, hostID, taskID, sha256Hex string) string {
+	msg := []byte("mcc-upload\n" + timestamp + "\n" + hostID + "\n" + taskID + "\n" + sha256Hex)
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(i.priv, msg))
+}

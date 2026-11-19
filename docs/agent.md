@@ -92,6 +92,9 @@ The control plane cannot override these. A `start` that breaks the policy is ans
 | `cache_max_gb` | no limit | Above this, the least recently used caches are deleted |
 | `host_tasks` | off | Lets work run on the host itself, without a VM; see [below](#jobs-on-the-host-itself) |
 | `tasks` | none | Commands the control plane may ask this host to run, by name; see [below](#tasks) |
+| `allowed_workloads` | `["github-runner"]` | The kinds of work this host takes. Add `"script"` to let callers run their own shell scripts in its VMs; see [below](#scripts-in-vms) |
+| `script_timeout_seconds` | 3600 | The longest a script may run. A request can ask for less, not more |
+| `task_output` | 64 MB a run, 1 GB in all, 7 days | How much of what tasks print is kept on this host; see [below](#task-output) |
 
 ## Xcode from the host
 
@@ -374,7 +377,166 @@ commands or the patterns. A run ends in one of these ways:
 | The task is not in the policy, or a parameter is not allowed | `failed`, code `refused_policy`; nothing runs |
 | No free slot, or `max_concurrent` reached | `failed`, code `refused_capacity`; nothing runs |
 
-For now a task's output goes to the agent's log at debug level and nowhere else.
+### Scripts in VMs
+
+A declared task is a command you wrote. A script is one the caller wrote: a shell script sent
+with the request. It is the only free-form work the control plane can send, so it is fenced
+twice. It runs only inside a VM, from a pool's image, deleted afterwards like a job's VM; a
+request for one on the host itself is refused. And the host takes scripts only if you say so:
+
+```json
+"allowed_workloads": ["github-runner", "script"],
+"script_timeout_seconds": 1800
+```
+
+`allowed_workloads` is the whole list of what the host accepts, and without it that is GitHub
+runners only, so an agent upgrade never widens what the host does. Declared tasks are not in
+the list: declaring one is the yes.
+
+The script reaches the VM on stdin and is run with `bash`. It is never an argument of a
+process on the host. It gets no Actions runner and no job cache, and the same VM limits
+(`max_vms`, `cpus`, `memory_mb`, network isolation) as a job. Its output is kept and read as
+a task's is, below, and it ends in the same ways.
+
+### Task output
+
+What a task prints, on stdout and stderr together, is kept on the host that ran it, in
+`task-output/` in the agent's directory. None of it is sent to the control plane.
+
+```json
+"task_output": { "max_mb": 64, "total_mb": 1024, "keep_days": 7 }
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `max_mb` | 64 | The most kept of one run. A task that prints more keeps running; what is past the limit is dropped, and the run is marked as cut short |
+| `total_mb` | 1024 | The most kept of all runs together. Past it, the runs that ended longest ago are deleted |
+| `keep_days` | 7 | How long a run's output is kept after it ends |
+| `upload` | false | Send finished output to the control plane to be kept, on plans that keep it; see [below](#letting-the-control-plane-keep-output) |
+
+A task that is still running is never deleted. Read a task's output on the host with its id
+from the API:
+
+```bash
+mcc logs -f 3f6c1f0e-5d0b-4a43-9a51-0c9f6f1f6a55
+```
+
+Without `-f` it prints what there is and returns; with it, it follows the task until it ends.
+`--offset N` starts N bytes in, to pick up after an interrupted read. If the task ended with
+an exit code other than 0, `mcc logs` exits with that code.
+
+`mcc logs` talks to the running agent over a Unix socket, `logs.sock` in the agent's
+directory, which only the agent's own account can open. The socket speaks HTTP, so another
+program on the host, an agent harness for one, can read output without `mcc`:
+
+```bash
+curl --unix-socket "$MCC_HOME/logs.sock" "http://mcc/v1/tasks/$TASK/output?offset=0&follow=1"
+```
+
+| Request | Answer |
+|---|---|
+| `GET /v1/tasks/<id>` | The run's record as JSON: when it started and ended, exit code, size kept |
+| `GET /v1/tasks/<id>/output?offset=N&follow=1` | The output from byte N on. With `follow=1` the response stays open until the task ends. It ends with trailers `X-Mcc-Exit-Code`, `X-Mcc-Code` (why there is no exit code) and `X-Mcc-Truncated` |
+
+On the owner's socket no secret is needed: its owner can read the files anyway. A request
+there that does show a secret, as `Authorization: Bearer <secret>` or in `MCC_TASK_SECRET`
+for `mcc logs`, must show the right one.
+
+### Reading output from another machine
+
+By default a host accepts no connections at all. To let whoever asked for a task read its
+output from where they are, without the output passing through the control plane, give the
+host an address to listen on:
+
+```json
+"task_output": { "listen": "0.0.0.0:7443", "address": "studio-01.example.com:7443" }
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `listen` | none | The address and port to listen on. Without it nothing listens |
+| `address` | the host's name and the port of `listen` | What callers are told to connect to, if that differs: a name they can resolve, or the outside of a port forward |
+
+This is the one port the agent ever opens, and it serves one thing: a task's output, over
+TLS, to a request that shows that task's secret. It answers the same way for a wrong secret
+as for a task that never ran here. A task whose caller chose no secret cannot be read
+through it by anyone. Reaching the port from outside your network is yours to arrange (a
+firewall rule, a port forward, a VPN); the agent does not.
+
+How a caller is recognised:
+
+1. The caller makes up a secret and gives the control plane its SHA-256 when it asks for the
+   task ([operations.md](operations.md#running-tasks)). The hash comes to this host with the
+   task. The control plane never has the secret.
+2. The listener has a key of its own, in `output.key` in the agent's directory, made the first
+   time it is needed. The agent tells the control plane the key's pin (the SHA-256 of the
+   public key), and the API passes the pin and `address` on to the caller.
+3. The caller connects, checks that the server has the key with that pin, and only then sends
+   the secret. There is no certificate authority involved; the certificate is self-signed
+   and the pin is the whole of the trust.
+
+From the other machine:
+
+```bash
+MCC_TASK_SECRET=$SECRET mcc logs -f --host studio-01.example.com:7443 --pin sha256//<pin> <task id>
+```
+
+```bash
+curl -k --pinnedpubkey "sha256//<pin>" -H "Authorization: Bearer $SECRET" \
+  "https://studio-01.example.com:7443/v1/tasks/<task id>/output?follow=1"
+```
+
+`-k` only tells curl not to look for a certificate authority; `--pinnedpubkey` is still
+enforced, and curl sends nothing to a server with another key.
+
+### Reading output through the control plane
+
+A caller who cannot reach the host at all, because it is behind a NAT or you would rather open
+no port, can read the same output through the control plane:
+
+```bash
+MCC_API_TOKEN=$API MCC_TASK_SECRET=$SECRET mcc logs -f --server https://api.mycompute.cloud <task id>
+```
+
+This needs no setting on the host: it uses the connection the agent already holds. What is
+sent is sealed between the caller and the host, so the control plane carries it without
+being able to read it:
+
+1. The caller makes a one-time key and agrees a shared key with the host's output key, the
+   one the pin is of. `output.key` exists on every host that keeps task output, whether or
+   not it listens.
+2. The caller sends the task's secret sealed under the shared key. The host checks it against
+   the hash that came with the task, as the listener does.
+3. The host sends the output in parts, each sealed under the shared key and tied to its place
+   in the stream. `mcc logs` refuses a part that is out of order or does not open.
+
+Parts are sent only while a caller is attached, no more than ten a second per stream, and at
+most eight streams at once per host. Nothing is written down on the way. A task without a
+secret cannot be read this way.
+
+The control plane can still cut a stream short. It cannot read, change or reorder one unless
+it also misled the caller about the host's key, which is what the pin guards against: pass
+`--pin` with the value from `mcc pin` and `mcc logs` checks the key against it before
+sending anything.
+
+### Letting the control plane keep output
+
+Everything above leaves output on the host. You can also let the host send a finished task's
+output to the control plane, to be kept and read later with only an API token:
+
+```json
+"task_output": { "upload": true }
+```
+
+This is off by default, and it is different in kind: stored output is something we can read.
+The host uploads only when the tenant's plan keeps output (the control plane says so with
+each task), signs the upload with its host key, and sends at most 64 MB of a run. Plans that
+keep none are never sent any.
+
+The pin reaches a caller through the control plane, so a caller who takes it from there is
+trusting the control plane to pass on the right one: a control plane that lied about the
+address and the pin could collect the secret. A caller who would rather not rely on that
+gets the pin from you instead. `mcc pin` prints the address and the pin on the host.
 
 ## Network isolation
 

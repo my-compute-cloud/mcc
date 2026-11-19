@@ -16,6 +16,9 @@ const (
 	TypeReject    = "reject"
 	TypeStart     = "start"
 	TypeStop      = "stop"
+	TypeAttach    = "attach"
+	TypeDetach    = "detach"
+	TypeOutput    = "output"
 	TypeConfig    = "config"
 )
 
@@ -89,7 +92,7 @@ type TaskCapacity struct {
 	MaxConcurrent int `json:"max_concurrent,omitempty"`
 }
 
-// Workload: What to run. The agent maps kind to a fixed entry command, or for a task to the command its owner declared under that name; there is no free-form command.
+// Workload: What to run. The agent maps kind to a fixed entry command, or for a task to the command its owner declared under that name. A script is the one free-form kind: it runs only inside a VM, and only on a host whose owner allows scripts.
 type Workload struct {
 	Kind string `json:"kind"`
 	// github-runner only
@@ -102,8 +105,16 @@ type Workload struct {
 	Task string `json:"task,omitempty"`
 	// task only: values for the parameters the task declares
 	Params []TaskParam `json:"params,omitempty"`
-	// task only: stop it after this long, if that is sooner than the owner's own limit
+	// task and script: stop it after this long, if that is sooner than the owner's own limit
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// script only: a shell script, run with bash inside the VM
+	Script string `json:"script,omitempty"`
+	// task and script: the task's id in the control plane's API, which its output is asked for by on the host
+	TaskID string `json:"task_id,omitempty"`
+	// task and script: the tenant's plan keeps output, so the host may upload this run's when it ends, if its owner allows uploads
+	StoreOutput bool `json:"store_output,omitempty"`
+	// task and script: SHA-256, in hex, of a secret the task's caller chose. The host gives the task's output to whoever shows that secret. The control plane never has the secret itself
+	OutputSecretHash string `json:"output_secret_hash,omitempty"`
 }
 
 // Hello: First message from the agent, answering challenge.
@@ -138,6 +149,14 @@ type Capacity struct {
 	HostSlotsFree  int `json:"host_slots_free,omitempty"`
 	// Tasks this host's owner has declared. Absent if none
 	Tasks []TaskCapacity `json:"tasks,omitempty"`
+	// True if this host's owner lets free-form scripts run in its VMs. Absent or false otherwise
+	Scripts bool `json:"scripts,omitempty"`
+	// host:port where this host gives a task's output to a caller that shows the task's secret. Absent unless its owner turned that on
+	OutputAddress string `json:"output_address,omitempty"`
+	// The public key of the host's output listener: base64 of its SubjectPublicKeyInfo. Present whenever the host keeps task output, whether or not it listens; a caller reading through the relay agrees an encryption key with it
+	OutputKey string `json:"output_key,omitempty"`
+	// SHA-256, in base64, of the public key of the listener at output_address. A caller connects only to a server that has that key
+	OutputPin string `json:"output_pin,omitempty"`
 }
 
 // GuestCapacity: One guest platform a host can run, and its own limit within the host's slots.
@@ -213,6 +232,58 @@ type Stop struct {
 	ID           string `json:"id"`
 	AssignmentID string `json:"assignment_id"`
 	Reason       string `json:"reason,omitempty"`
+}
+
+// Attach: A caller wants a task's output relayed. The control plane passes this on and understands none of it but the ids: client_key and salt agree an encryption key with the host, and auth is the task's secret sealed under that key.
+type Attach struct {
+	Type string `json:"type"`
+	V    int    `json:"v"`
+	ID   string `json:"id"`
+	// Names this stream in output and detach
+	StreamID string `json:"stream_id"`
+	TaskID   string `json:"task_id"`
+	// Start this many bytes into the output
+	Offset int `json:"offset,omitempty"`
+	// Keep sending until the task ends
+	Follow bool `json:"follow,omitempty"`
+	// The caller's one-time P-256 public key, base64
+	ClientKey string `json:"client_key"`
+	// Random, chosen by the caller, base64
+	Salt string `json:"salt"`
+	// The task's secret, sealed with the agreed key, base64
+	Auth string `json:"auth"`
+}
+
+// Detach: The caller has gone; stop sending.
+type Detach struct {
+	Type     string `json:"type"`
+	V        int    `json:"v"`
+	ID       string `json:"id"`
+	StreamID string `json:"stream_id"`
+}
+
+// Output: Part of a task's output for a caller attached through the relay, sealed so that only that caller can read it. Sent only while a caller is attached.
+type Output struct {
+	Type     string `json:"type"`
+	V        int    `json:"v"`
+	ID       string `json:"id"`
+	StreamID string `json:"stream_id"`
+	// Counts the data frames of this stream from 0
+	Seq int `json:"seq,omitempty"`
+	// Where this part starts in the output; absent means 0
+	Offset int `json:"offset,omitempty"`
+	// The part, sealed, base64
+	Data string `json:"data,omitempty"`
+	// Nothing more follows
+	End bool `json:"end,omitempty"`
+	// With end: the task's exit code, if it ran to an exit. Absent means 0 unless code is set
+	ExitCode int `json:"exit_code,omitempty"`
+	// With end: why the task has no exit code; running if the stream ended before the task did
+	Code string `json:"code,omitempty"`
+	// With end: the task printed more than the host kept
+	Truncated bool `json:"truncated,omitempty"`
+	// The stream could not be started, or broke
+	Error string `json:"error,omitempty"`
 }
 
 type Config struct {

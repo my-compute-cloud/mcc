@@ -16,6 +16,7 @@ import (
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/fake"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/process"
 	"github.com/my-compute-cloud/mcc/agent/internal/identity"
+	"github.com/my-compute-cloud/mcc/agent/internal/tasklog"
 )
 
 // oneRunner is a RunnerSource with the same runner for every platform.
@@ -48,7 +49,7 @@ func stubRunner(t *testing.T, record string) string {
 	return dir
 }
 
-func startHostAgent(t *testing.T, policy config.Policy, runner RunnerSource) (*controlPlane, *fake.Fake, *process.Process) {
+func startHostAgent(t *testing.T, policy config.Policy, runner RunnerSource, with ...func(*Options)) (*controlPlane, *fake.Fake, *process.Process) {
 	t.Helper()
 	id := identity.FromSeed(make([]byte, 32))
 	cp := newControlPlane(t, id)
@@ -63,6 +64,9 @@ func startHostAgent(t *testing.T, policy config.Policy, runner RunnerSource) (*c
 	}
 	if policy.HostTasks.Enabled {
 		o.HostExecutor = px
+	}
+	for _, f := range with {
+		f(&o)
 	}
 	a := New(o)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -450,5 +454,104 @@ func TestTasksInPolicyAreChecked(t *testing.T) {
 	// A pattern matches the whole value or not at all.
 	if err := ok.CheckParams(map[string]string{"SCHEME": "app1"}); err == nil {
 		t.Error("a value the pattern only partly matches was allowed")
+	}
+}
+
+func TestWhatATaskPrintsIsKeptOnTheHostUnderTheTasksID(t *testing.T) {
+	store := tasklog.New(t.TempDir(), tasklog.Limits{})
+	policy := taskPolicy(t, filepath.Join(t.TempDir(), "r"), `echo "building $MCC_PARAM_SCHEME"; echo "warning" >&2; exit 3`)
+	cp, _, _ := startHostAgent(t, policy, oneRunner(""), func(o *Options) { o.TaskOutput = store })
+	<-cp.hellos
+
+	start := taskStart("a1", "build", map[string]string{"SCHEME": "App"}, 0)
+	start["workload"].(map[string]any)["task_id"] = "task-1"
+	start["workload"].(map[string]any)["output_secret_hash"] = "abc123"
+	cp.send(start)
+	m := cp.next(status("a1", "finished"))
+	// None of the output travels with the status.
+	for k, v := range m {
+		if s, ok := v.(string); ok && strings.Contains(s, "building") {
+			t.Errorf("status carries output in %s: %q", k, s)
+		}
+	}
+
+	var out strings.Builder
+	rec, err := store.Copy(&out, "task-1", 0, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); !strings.Contains(got, "building App\n") || !strings.Contains(got, "warning\n") {
+		t.Errorf("kept output %q", got)
+	}
+	if rec.Running() || rec.ExitCode == nil || *rec.ExitCode != 3 || rec.AssignmentID != "a1" || rec.Task != "build" || rec.SecretHash != "abc123" {
+		t.Errorf("record %+v", rec)
+	}
+
+	// A task that is stopped keeps what it printed, and its record says why it has no exit code.
+	slow := taskPolicy(t, filepath.Join(t.TempDir(), "r"), `echo started; sleep 30`)
+	cp2, _, _ := startHostAgent(t, slow, oneRunner(""), func(o *Options) { o.TaskOutput = store })
+	<-cp2.hellos
+	cp2.send(taskStart("a2", "build", nil, 0))
+	cp2.next(status("a2", "running"))
+	deadline := time.Now().Add(5 * time.Second)
+	for store.Size("a2") == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cp2.send(map[string]any{"type": "stop", "assignment_id": "a2"})
+	cp2.next(status("a2", "failed"))
+	out.Reset()
+	// Without a task id from the control plane, the assignment's id names the output.
+	rec, err = store.Copy(&out, "a2", 0, false, nil, nil)
+	if err != nil || out.String() != "started\n" || rec.Running() || rec.Code != "stopped" || rec.ExitCode != nil {
+		t.Errorf("stopped task: %q %+v %v", out.String(), rec, err)
+	}
+}
+
+func TestTheAgentSaysWhereItServesOutputOnlyIfItsOwnerTurnedThatOn(t *testing.T) {
+	policy := taskPolicy(t, filepath.Join(t.TempDir(), "r"), "exit 0")
+	cp, _, _ := startHostAgent(t, policy, oneRunner(""))
+	<-cp.hellos
+	capacity := cp.next(isType("capacity"))
+	if _, has := capacity["output_address"]; has {
+		t.Errorf("an address was reported: %v", capacity)
+	}
+	if _, has := capacity["output_pin"]; has {
+		t.Errorf("a pin was reported: %v", capacity)
+	}
+
+	cp2, _, _ := startHostAgent(t, policy, oneRunner(""), func(o *Options) { o.OutputAddress, o.OutputPin = "studio-01.local:7443", "pin" })
+	<-cp2.hellos
+	capacity = cp2.next(isType("capacity"))
+	if capacity["output_address"] != "studio-01.local:7443" || capacity["output_pin"] != "pin" {
+		t.Errorf("capacity %v", capacity)
+	}
+}
+
+func TestTaskOutputPolicyIsChecked(t *testing.T) {
+	bad := []config.TaskOutput{
+		{MaxMB: -1},
+		{Listen: "7443"},
+		{Listen: "0.0.0.0:7443", Address: "studio-01.local"},
+		{Address: "studio-01.local:7443"}, // an address to tell callers, and nothing listening
+	}
+	for _, o := range bad {
+		p := config.DefaultPolicy()
+		p.TaskOutput = o
+		if err := p.Validate(); err == nil {
+			t.Errorf("task_output %+v should be refused", o)
+		}
+	}
+	if got := (config.TaskOutput{}).Reachable(); got != "" {
+		t.Errorf("a host that does not listen is reachable at %q", got)
+	}
+	if got := (config.TaskOutput{Listen: "192.168.1.20:7443"}).Reachable(); got != "192.168.1.20:7443" {
+		t.Errorf("Reachable = %q", got)
+	}
+	if got := (config.TaskOutput{Listen: "0.0.0.0:7443", Address: "ci.example.com:443"}).Reachable(); got != "ci.example.com:443" {
+		t.Errorf("Reachable = %q", got)
+	}
+	// "Every interface" is not somewhere to connect to: callers are told the host's name.
+	if got := (config.TaskOutput{Listen: "0.0.0.0:7443"}).Reachable(); strings.HasPrefix(got, "0.0.0.0") || !strings.HasSuffix(got, ":7443") {
+		t.Errorf("Reachable = %q", got)
 	}
 }

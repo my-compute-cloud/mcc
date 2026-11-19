@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/my-compute-cloud/mcc/agent/internal/executor"
 	"github.com/my-compute-cloud/mcc/agent/internal/protocol"
+	"github.com/my-compute-cloud/mcc/agent/internal/tasklog"
 )
 
 func newID() string {
@@ -124,7 +126,13 @@ const (
 const (
 	workloadGitHubRunner = "github-runner"
 	workloadTask         = "task"
+	workloadScript       = "script"
 )
+
+// scriptEntry is the fixed entry command of a script. The script itself arrives on stdin, so
+// that it is never an argument on the host: an argument can be read by every account there,
+// and a caller's script may hold what the caller would not want read.
+const scriptEntry = "exec /bin/bash -s\n"
 
 // policyCheck returns why a start must be refused, with its code, or "".
 func (a *Agent) policyCheck(m protocol.Start) (reason, code string) {
@@ -147,17 +155,33 @@ func (a *Agent) policyCheck(m protocol.Start) (reason, code string) {
 	if !ok || known.Source != m.Image.Source {
 		return fmt.Sprintf("image %s is not in this host's pool configuration", m.Image.Name), codeRefusedPolicy
 	}
-	if m.Workload.Kind != workloadGitHubRunner {
+	switch m.Workload.Kind {
+	case workloadGitHubRunner:
+		if !p.WorkloadAllowed(workloadGitHubRunner) {
+			return "GitHub Actions jobs are not allowed on this host (allowed_workloads in its policy)", codeRefusedPolicy
+		}
+		if len(p.AllowedGitHubURLs) > 0 {
+			r, err := jitRunner(m.Workload.JITConfig)
+			if err != nil {
+				return "could not read runner configuration to check allowed_github_urls", codeRefusedPolicy
+			}
+			if !p.GitHubURLAllowed(r.GitHubURL) {
+				return fmt.Sprintf("runner for %s not allowed by local policy", r.GitHubURL), codeRefusedPolicy
+			}
+		}
+	case workloadScript:
+		// The one kind of work whose command the owner did not write. It is confined to a VM,
+		// and still needs the owner's yes.
+		if !p.WorkloadAllowed(workloadScript) {
+			return "scripts are not allowed on this host (allowed_workloads in its policy)", codeRefusedPolicy
+		}
+		if strings.TrimSpace(m.Workload.Script) == "" {
+			return "the script is empty", codeRefusedPolicy
+		}
+	case workloadTask:
+		return "a declared task runs on the host itself, not in a VM", codeRefusedPolicy
+	default:
 		return fmt.Sprintf("unsupported workload %q", m.Workload.Kind), codeRefusedPolicy
-	}
-	if len(p.AllowedGitHubURLs) > 0 {
-		r, err := jitRunner(m.Workload.JITConfig)
-		if err != nil {
-			return "could not read runner configuration to check allowed_github_urls", codeRefusedPolicy
-		}
-		if !p.GitHubURLAllowed(r.GitHubURL) {
-			return fmt.Sprintf("runner for %s not allowed by local policy", r.GitHubURL), codeRefusedPolicy
-		}
 	}
 	if a.activeCount() >= a.slotsTotal() {
 		return "no free slot", codeRefusedCapacity
@@ -187,6 +211,9 @@ func (a *Agent) hostPolicyCheck(m protocol.Start) (reason, code string) {
 	}
 	if m.Workload.Kind == workloadTask {
 		return a.taskPolicyCheck(m.Workload)
+	}
+	if m.Workload.Kind == workloadScript {
+		return "a script runs only in a VM, never on the host itself", codeRefusedPolicy
 	}
 	if m.Workload.Kind != workloadGitHubRunner {
 		return fmt.Sprintf("unsupported workload %q", m.Workload.Kind), codeRefusedPolicy
@@ -286,40 +313,70 @@ func (a *Agent) executeTask(ctx context.Context, as *assignment, m protocol.Star
 		return false, fmt.Sprintf("preparing the task's directory: %v", err)
 	}
 
-	limit := spec.Timeout()
+	return a.runToExit(ctx, as, m, lg, ex, h, executor.Command{Script: taskScript(spec.Command), Env: env}, spec.Timeout())
+}
+
+// runToExit runs a task's or a script's command where the executor has made room for it, until
+// it exits, is stopped, or reaches the sooner of the owner's time limit and the request's.
+func (a *Agent) runToExit(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger, ex executor.Executor, h executor.Handle, cmd executor.Command, limit time.Duration) (bool, string) {
 	if t := time.Duration(m.Workload.TimeoutSeconds) * time.Second; t > 0 && t < limit {
 		limit = t
 	}
 	tctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 
-	pr, pw := io.Pipe()
-	go func() {
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 64*1024), 1024*1024)
-		for sc.Scan() {
-			lg.Debug("task", "line", sc.Text())
+	// What the task prints stays on this host: in a file a caller can read from here, if the
+	// owner keeps any. None of it goes to the control plane.
+	var out io.Writer = io.Discard
+	var kept *tasklog.Log
+	if a.o.TaskOutput != nil {
+		id := m.Workload.TaskID
+		if id == "" {
+			id = m.AssignmentID
 		}
-		// A line too long to scan must not block the task on a full pipe.
-		_, _ = io.Copy(io.Discard, pr)
-	}()
+		l, err := a.o.TaskOutput.Create(tasklog.Meta{ID: id, AssignmentID: m.AssignmentID, Task: cmp.Or(m.Workload.Task, m.Workload.Kind), SecretHash: m.Workload.OutputSecretHash})
+		if err != nil {
+			lg.Warn("the task's output will not be kept", "err", err)
+		} else {
+			out, kept = l, l
+			go a.o.TaskOutput.Prune()
+		}
+	}
+	end := func(exitCode *int, code string) {
+		if kept == nil {
+			return
+		}
+		kept.Close(exitCode, code)
+		// Kept by the control plane too, if the tenant's plan asks and this host's owner agrees.
+		if m.Workload.StoreOutput && a.o.Policy.TaskOutput.Upload && m.Workload.TaskID != "" {
+			a.wg.Add(1)
+			go func() {
+				defer a.wg.Done()
+				a.uploadOutput(m.Workload.TaskID, lg)
+			}()
+		}
+	}
 
 	a.setState(as.id, protocol.AgentAssignmentStateRunning, "")
-	code, err := ex.Exec(tctx, h, executor.Command{Script: taskScript(spec.Command), Env: env, Output: pw})
-	pw.Close()
+	cmd.Output = out
+	code, err := ex.Exec(tctx, h, cmd)
 
 	switch {
 	case a.stopReason(as) != "":
 		a.setOutcome(as, codeStopped, 0)
+		end(nil, codeStopped)
 		return false, a.stopReason(as)
 	case tctx.Err() == context.DeadlineExceeded:
 		a.setOutcome(as, codeTimeout, 0)
+		end(nil, codeTimeout)
 		return false, fmt.Sprintf("stopped after its time limit of %s", limit)
 	case err != nil:
+		end(nil, "failed")
 		return false, fmt.Sprintf("running task: %v", err)
 	}
 	// It ran to an exit. That is "finished" whatever the exit code, which goes with it.
 	a.setOutcome(as, "", code)
+	end(&code, "")
 	if code != 0 {
 		return true, fmt.Sprintf("exited with code %d", code)
 	}
@@ -401,6 +458,7 @@ func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
 		}
 	} else {
 		as.platform = guestPlatform(m.Image)
+		as.script = m.Workload.Kind == workloadScript
 	}
 	a.mu.Lock()
 	a.assignments[m.AssignmentID] = as
@@ -530,12 +588,14 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 		IsolateNetwork: a.o.Policy.NetworkIsolation() && a.isolationOK,
 	}
 	opts.SharedDirs = map[string]executor.SharedDir{}
-	if a.o.Policy.SharedRunnerEnabled() && a.o.Runner != nil {
+	// A script is not a GitHub job: it gets no runner and no job cache, only the VM.
+	runner := m.Workload.Kind == workloadGitHubRunner
+	if runner && a.o.Policy.SharedRunnerEnabled() && a.o.Runner != nil {
 		if dir := a.o.Runner.Current(guestPlatform(m.Image)); dir != "" {
 			opts.SharedDirs[runnerShare] = executor.SharedDir{Path: dir}
 		}
 	}
-	if a.o.Cache != nil {
+	if runner && a.o.Cache != nil {
 		// A job that cannot be placed in a cache runs without one rather than sharing
 		// someone else's.
 		if dir, release, err := a.jobCache(m); err != nil {
@@ -565,6 +625,10 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 	}()
 	lg.Info("VM started", "vm", h.Name, "boot", time.Since(started).Round(time.Millisecond))
 
+	if !runner {
+		return a.runToExit(ctx, as, m, lg, a.o.Executor, h,
+			executor.Command{Script: scriptEntry, Stdin: strings.NewReader(m.Workload.Script)}, a.o.Policy.ScriptTimeout())
+	}
 	return a.runRunner(ctx, as, m, lg, a.o.Executor, h, entryScript(m.Image), nil)
 }
 

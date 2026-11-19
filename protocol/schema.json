@@ -5,8 +5,8 @@
   "description": "Messages exchanged over the agent WebSocket. Every message carries type, v (protocol version) and id. Generated types: protocol/gen/messages.ts and agent/internal/protocol/messages.go (run `bun run protocol:gen`).",
   "x-protocol-versions": [1],
   "x-directions": {
-    "agent": ["hello", "capacity", "status", "heartbeat"],
-    "server": ["challenge", "welcome", "reject", "start", "stop", "config"]
+    "agent": ["hello", "capacity", "status", "heartbeat", "output"],
+    "server": ["challenge", "welcome", "reject", "start", "stop", "config", "attach", "detach"]
   },
   "$defs": {
     "Platform": {
@@ -81,15 +81,19 @@
     },
     "Workload": {
       "type": "object",
-      "description": "What to run. The agent maps kind to a fixed entry command, or for a task to the command its owner declared under that name; there is no free-form command.",
+      "description": "What to run. The agent maps kind to a fixed entry command, or for a task to the command its owner declared under that name. A script is the one free-form kind: it runs only inside a VM, and only on a host whose owner allows scripts.",
       "properties": {
-        "kind": { "type": "string", "enum": ["github-runner", "task"] },
+        "kind": { "type": "string", "enum": ["github-runner", "task", "script"] },
         "runner_name": { "type": "string", "description": "github-runner only" },
         "jit_config": { "type": "string", "description": "github-runner only: GitHub just-in-time runner configuration, single use" },
         "idle_timeout_seconds": { "type": "integer", "description": "github-runner only: stop the work if the runner has not taken a job by then" },
         "task": { "type": "string", "description": "task only: the name of a task declared in the host's policy" },
         "params": { "type": "array", "items": { "$ref": "#/$defs/TaskParam" }, "description": "task only: values for the parameters the task declares" },
-        "timeout_seconds": { "type": "integer", "description": "task only: stop it after this long, if that is sooner than the owner's own limit" }
+        "timeout_seconds": { "type": "integer", "description": "task and script: stop it after this long, if that is sooner than the owner's own limit" },
+        "script": { "type": "string", "description": "script only: a shell script, run with bash inside the VM" },
+        "task_id": { "type": "string", "description": "task and script: the task's id in the control plane's API, which its output is asked for by on the host" },
+        "store_output": { "type": "boolean", "description": "task and script: the tenant's plan keeps output, so the host may upload this run's when it ends, if its owner allows uploads" },
+        "output_secret_hash": { "type": "string", "description": "task and script: SHA-256, in hex, of a secret the task's caller chose. The host gives the task's output to whoever shows that secret. The control plane never has the secret itself" }
       },
       "required": ["kind"]
     },
@@ -123,7 +127,11 @@
         },
         "host_slots_total": { "type": "integer", "description": "How much work this host runs directly, without a VM, at once. Absent or 0 unless its owner allows that" },
         "host_slots_free": { "type": "integer" },
-        "tasks": { "type": "array", "items": { "$ref": "#/$defs/TaskCapacity" }, "description": "Tasks this host's owner has declared. Absent if none" }
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/TaskCapacity" }, "description": "Tasks this host's owner has declared. Absent if none" },
+        "scripts": { "type": "boolean", "description": "True if this host's owner lets free-form scripts run in its VMs. Absent or false otherwise" },
+        "output_address": { "type": "string", "description": "host:port where this host gives a task's output to a caller that shows the task's secret. Absent unless its owner turned that on" },
+        "output_key": { "type": "string", "description": "The public key of the host's output listener: base64 of its SubjectPublicKeyInfo. Present whenever the host keeps task output, whether or not it listens; a caller reading through the relay agrees an encryption key with it" },
+        "output_pin": { "type": "string", "description": "SHA-256, in base64, of the public key of the listener at output_address. A caller connects only to a server that has that key" }
       },
       "required": ["slots_total", "slots_free", "images_ready", "accepting"]
     },
@@ -204,6 +212,47 @@
         "reason": { "type": "string" }
       },
       "required": ["assignment_id"]
+    },
+    "Attach": {
+      "type": "object",
+      "x-message": "attach",
+      "description": "A caller wants a task's output relayed. The control plane passes this on and understands none of it but the ids: client_key and salt agree an encryption key with the host, and auth is the task's secret sealed under that key.",
+      "properties": {
+        "stream_id": { "type": "string", "description": "Names this stream in output and detach" },
+        "task_id": { "type": "string" },
+        "offset": { "type": "integer", "description": "Start this many bytes into the output" },
+        "follow": { "type": "boolean", "description": "Keep sending until the task ends" },
+        "client_key": { "type": "string", "description": "The caller's one-time P-256 public key, base64" },
+        "salt": { "type": "string", "description": "Random, chosen by the caller, base64" },
+        "auth": { "type": "string", "description": "The task's secret, sealed with the agreed key, base64" }
+      },
+      "required": ["stream_id", "task_id", "client_key", "salt", "auth"]
+    },
+    "Detach": {
+      "type": "object",
+      "x-message": "detach",
+      "description": "The caller has gone; stop sending.",
+      "properties": {
+        "stream_id": { "type": "string" }
+      },
+      "required": ["stream_id"]
+    },
+    "Output": {
+      "type": "object",
+      "x-message": "output",
+      "description": "Part of a task's output for a caller attached through the relay, sealed so that only that caller can read it. Sent only while a caller is attached.",
+      "properties": {
+        "stream_id": { "type": "string" },
+        "seq": { "type": "integer", "description": "Counts the data frames of this stream from 0" },
+        "offset": { "type": "integer", "description": "Where this part starts in the output; absent means 0" },
+        "data": { "type": "string", "description": "The part, sealed, base64" },
+        "end": { "type": "boolean", "description": "Nothing more follows" },
+        "exit_code": { "type": "integer", "description": "With end: the task's exit code, if it ran to an exit. Absent means 0 unless code is set" },
+        "code": { "type": "string", "description": "With end: why the task has no exit code; running if the stream ended before the task did" },
+        "truncated": { "type": "boolean", "description": "With end: the task printed more than the host kept" },
+        "error": { "type": "string", "description": "The stream could not be started, or broke" }
+      },
+      "required": ["stream_id"]
     },
     "Config": {
       "type": "object",

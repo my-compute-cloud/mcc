@@ -3,17 +3,23 @@
 //	mcc enroll --server URL [--name NAME] TOKEN   register this host with the control plane
 //	mcc run                                       connect and run work (normally as a service)
 //	mcc policy                                    print the effective local policy
+//	mcc logs [-f] [--offset N] TASK               print what a task printed on this host
+//	mcc logs --host ADDR --pin PIN [-f] TASK      the same from another host, with MCC_TASK_SECRET
+//	mcc logs --server URL [-f] TASK               the same through the control plane, sealed end to end
+//	mcc pin                                       print where this host serves output, and its key's pin
 //	mcc version
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,6 +42,7 @@ import (
 	"github.com/my-compute-cloud/mcc/agent/internal/executor/tart"
 	"github.com/my-compute-cloud/mcc/agent/internal/identity"
 	"github.com/my-compute-cloud/mcc/agent/internal/runnerbin"
+	"github.com/my-compute-cloud/mcc/agent/internal/tasklog"
 )
 
 func main() {
@@ -50,6 +57,10 @@ func main() {
 		err = run(os.Args[2:])
 	case "policy":
 		err = showPolicy()
+	case "logs":
+		err = logs(os.Args[2:])
+	case "pin":
+		err = showPin()
 	case "version":
 		fmt.Println(agent.Version)
 	default:
@@ -62,7 +73,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: mcc enroll --server URL [--name NAME] TOKEN | mcc run | mcc policy | mcc version")
+	fmt.Fprintln(os.Stderr, "usage: mcc enroll --server URL [--name NAME] TOKEN | mcc run | mcc policy | mcc logs [-f] TASK | mcc pin | mcc version")
 	os.Exit(2)
 }
 
@@ -177,6 +188,48 @@ func run(args []string) error {
 		log.Info("this host runs work without a VM", "dir", work, "user", policy.HostTasks.User, "at_once", policy.HostTasks.Slots())
 	}
 
+	// What tasks print is kept here, on the host, and read from here: `mcc logs`, or anything
+	// that speaks HTTP to the socket. The socket is the agent's own account's alone.
+	var taskOutput *tasklog.Store
+	if len(policy.Tasks) > 0 || policy.WorkloadAllowed("script") {
+		o := policy.TaskOutput
+		taskOutput = tasklog.New(filepath.Join(dir, "task-output"), tasklog.Limits{
+			PerTask: int64(o.MaxMB) << 20,
+			Total:   int64(o.TotalMB) << 20,
+			KeepFor: time.Duration(o.KeepDays) * 24 * time.Hour,
+		})
+		taskOutput.Recover()
+		go taskOutput.Prune()
+		go func() {
+			if err := taskOutput.ServeUnix(ctx, logSocket(dir)); err != nil {
+				log.Warn("task output cannot be read with `mcc logs`", "err", err)
+			}
+		}()
+	}
+	// Only if the owner asked for it does this host accept a connection: one listener, which
+	// gives a task's output to whoever shows that task's secret, and nothing else to anyone.
+	var outputAddress, outputPin string
+	var outputKey *ecdsa.PrivateKey
+	if taskOutput != nil {
+		// The key is made whether or not the host listens: a caller who cannot reach the host
+		// reads through the control plane, sealed to this key.
+		key, err := tasklog.LoadOrCreateKey(outputKeyPath(dir))
+		if err != nil {
+			log.Error("task output can only be read on this host", "err", err)
+		} else if pin, err := tasklog.Pin(&key.PublicKey); err == nil {
+			outputKey, outputPin = key, pin
+		}
+	}
+	if outputKey != nil && policy.TaskOutput.Listen != "" {
+		address, err := serveOutput(ctx, outputKey, policy.TaskOutput, taskOutput, log)
+		if err != nil {
+			log.Error("task output will not be served to other machines", "listen", policy.TaskOutput.Listen, "err", err)
+		} else {
+			outputAddress = address
+			log.Info("serving task output to callers that show a task's secret", "listen", policy.TaskOutput.Listen, "address", address, "pin", outputPin)
+		}
+	}
+
 	var runners runnerSet
 	var platforms []string
 	if policy.SharedRunnerEnabled() {
@@ -208,19 +261,136 @@ func run(args []string) error {
 	}
 
 	a := agent.New(agent.Options{
-		ServerURL:    state.ServerURL,
-		HostID:       state.HostID,
-		Identity:     id,
-		Policy:       policy,
-		Executor:     ex,
-		HostExecutor: hostEx,
-		Runner:       runnerSource(runners),
-		Cache:        jobCache,
-		Log:          log,
-		Resources:    resources(policy),
+		ServerURL:     state.ServerURL,
+		HostID:        state.HostID,
+		Identity:      id,
+		Policy:        policy,
+		Executor:      ex,
+		HostExecutor:  hostEx,
+		Runner:        runnerSource(runners),
+		Cache:         jobCache,
+		TaskOutput:    taskOutput,
+		OutputAddress: outputAddress,
+		OutputPin:     outputPin,
+		OutputKey:     outputKey,
+		Log:           log,
+		Resources:     resources(policy),
 	})
 	log.Info("starting agent", "version", agent.Version, "host", state.HostID, "server", state.ServerURL)
 	return a.Run(ctx)
+}
+
+// outputKeyPath is where the host's output key is kept: the key callers pin, for the listener
+// and for reads through the control plane.
+func outputKeyPath(dir string) string { return filepath.Join(dir, "output.key") }
+
+// serveOutput starts the listener for callers on other machines, and returns the address they
+// are told.
+func serveOutput(ctx context.Context, key *ecdsa.PrivateKey, o config.TaskOutput, store *tasklog.Store, log *slog.Logger) (address string, err error) {
+	address = o.Reachable()
+	cert, err := tasklog.Certificate(key, address)
+	if err != nil {
+		return "", err
+	}
+	ln, err := net.Listen("tcp", o.Listen)
+	if err != nil {
+		return "", err
+	}
+	go func() {
+		if err := store.ServeTLS(ctx, ln, cert); err != nil {
+			log.Error("the task output listener stopped", "err", err)
+		}
+	}()
+	return address, nil
+}
+
+// showPin prints where this host serves task output and the pin of its key, for a caller who
+// would sooner have the pin from the host's owner than from the control plane.
+func showPin() error {
+	dir, err := config.Dir()
+	if err != nil {
+		return err
+	}
+	policy, err := config.LoadPolicy(dir)
+	if err != nil {
+		return err
+	}
+	key, err := tasklog.LoadOrCreateKey(outputKeyPath(dir))
+	if err != nil {
+		return err
+	}
+	pin, err := tasklog.Pin(&key.PublicKey)
+	if err != nil {
+		return err
+	}
+	address := policy.TaskOutput.Reachable()
+	if address == "" {
+		address = "(this host does not listen; output is read here, or through the control plane)"
+	}
+	fmt.Printf("address  %s\npin      sha256//%s\n", address, pin)
+	return nil
+}
+
+// logSocket is where a running agent serves what tasks printed.
+func logSocket(dir string) string { return filepath.Join(dir, "logs.sock") }
+
+// logs prints a task's output from the agent running on this host. Its exit status is the
+// task's, when the task has ended and the output was read to its end.
+func logs(args []string) error {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	follow := fs.Bool("f", false, "keep printing until the task ends")
+	offset := fs.Int64("offset", 0, "start this many bytes into the output")
+	host := fs.String("host", "", "read from another host: the address the task's output is at")
+	pin := fs.String("pin", "", "the pin of that host's key: needed with --host, and with --server it is checked against the control plane's word")
+	server := fs.String("server", "", "read through the control plane at this URL, for a host that cannot be reached")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 || (*host != "" && *pin == "") || (*host != "" && *server != "") || (*pin != "" && *host == "" && *server == "") {
+		return fmt.Errorf("usage: mcc logs [-f] [--offset N] [--host ADDR --pin PIN | --server URL [--pin PIN]] TASK")
+	}
+	dir, err := config.Dir()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// The secret, for a task that has one, comes from the environment: an argument could be
+	// read by every account on the host.
+	secret := os.Getenv("MCC_TASK_SECRET")
+	var end tasklog.End
+	if *server != "" {
+		// Through the control plane, sealed between this program and the host. The API token
+		// says whose task it is; like the secret, it comes from the environment.
+		end, err = tasklog.ReadRelay(ctx, nil, *server, os.Getenv("MCC_API_TOKEN"), fs.Arg(0), secret, *pin, *offset, *follow, os.Stdout)
+	} else if *host != "" {
+		end, err = tasklog.ReadTLS(ctx, *host, *pin, fs.Arg(0), secret, *offset, *follow, os.Stdout)
+	} else {
+		end, err = tasklog.ReadUnix(ctx, logSocket(dir), fs.Arg(0), secret, *offset, *follow, os.Stdout)
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if *server != "" {
+			return fmt.Errorf("reading the task's output through %s: %w", *server, err)
+		}
+		if *host != "" {
+			return fmt.Errorf("reading the task's output from %s: %w", *host, err)
+		}
+		return fmt.Errorf("reading the task's output (is the agent running on this host?): %w", err)
+	}
+	if end.Truncated {
+		fmt.Fprintln(os.Stderr, "mcc: the task printed more than this host keeps; the rest was dropped")
+	}
+	switch {
+	case end.Running:
+		fmt.Fprintln(os.Stderr, "mcc: the task is still running; -f follows it")
+	case end.ExitCode != nil && *end.ExitCode != 0:
+		fmt.Fprintf(os.Stderr, "mcc: the task exited with code %d\n", *end.ExitCode)
+		os.Exit(*end.ExitCode)
+	case end.Code != "":
+		return fmt.Errorf("the task did not run to an exit: %s", end.Code)
+	}
+	return nil
 }
 
 // newExecutor is how this host runs VMs: Tart on a Mac, QEMU with KVM on Linux. MCC_EXECUTOR

@@ -155,3 +155,11 @@ func (f *Fake) Script(id string) string {
 	defer f.mu.Unlock()
 	return f.Scripts[id]
 }
+
+// Given returns what a machine was started and run with: its entry command, what that command
+// read on stdin, and its start options.
+func (f *Fake) Given(assignmentID string) (entry, stdin string, opts executor.StartOptions) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Scripts[assignmentID], f.Stdin[assignmentID], f.Options[assignmentID]
+}
