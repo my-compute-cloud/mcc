@@ -133,6 +133,40 @@ takes no new work and returns once nothing is running; `mcc resume` undoes it. O
 host's owner can drain it: the agent listens for this on `agent.sock` in its state directory,
 which only its own account can open.
 
+## Debugging, and running a build of your own
+
+When a runner exits before it takes a job, the failure says what the runner said last
+("runner exited with code 1 before taking a job; it said: ..."), in the agent's log, in
+`mcc status` and in the dashboard.
+
+For everything, turn on debug logging. In the host's policy:
+
+```json
+"log_level": "debug"
+```
+
+The agent then logs each line a runner prints before it takes a job, among much else. `mcc run
+-v` does the same for one run. With the nix-darwin module, set
+`services.mcc-agent.policy.log_level = "debug"`.
+
+To try a build of your own, the service does not have to be stopped. The agent that is
+running will become it:
+
+```bash
+mcc use ./mcc --debug
+```
+
+It finishes what it has, as for an upgrade, and then replaces itself with that build: same
+service, same log file, nothing to restart and nothing for macOS to ask permission for.
+`mcc check` says when a build that is not the installed one is running.
+
+```bash
+mcc use --installed
+```
+
+goes back. So does the next update that changes the installed agent. After changing the
+policy file, `mcc use --installed` is also how to make the agent read it again.
+
 ## Local policy
 
 Nothing outside the host can change its policy: not the API, not `mcc` signed in from another
@@ -163,6 +197,7 @@ The control plane cannot override these. A `start` that breaks the policy is ans
 | `tasks` | none | Commands the control plane may ask this host to run, by name; see [below](#tasks) |
 | `allowed_workloads` | `["github-runner"]` | The kinds of work this host takes. Add `"script"` to let callers run their own shell scripts in its VMs; see [below](#scripts-in-vms) |
 | `script_timeout_seconds` | 3600 | The longest a script may run. A request can ask for less, not more |
+| `log_level` | `info` | `debug` logs everything; see [above](#debugging-and-running-a-build-of-your-own) |
 | `upgrade_wait_minutes` | 360 | How long running work may hold back a switch to a newer agent that has been installed; 0 for as long as it takes. See [above](#upgrading-and-draining-a-host) |
 | `task_output` | 64 MB a run, 1 GB in all, 7 days | How much of what tasks print is kept on this host; see [below](#task-output) |
 

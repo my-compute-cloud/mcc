@@ -98,6 +98,10 @@ func (a *Agent) WaitIdle(ctx context.Context) error {
 // Activity is what the agent is doing, for its owner.
 type Activity struct {
 	Version string `json:"version"`
+	// Executable is the file this agent runs from. Installed is false when its owner put a
+	// build of their own in the service's place with `mcc use`.
+	Executable string `json:"executable"`
+	Installed  bool   `json:"installed"`
 	// Connected is whether it has a connection to the control plane now.
 	Connected bool           `json:"connected"`
 	Work      []ActivityWork `json:"work"`
@@ -120,15 +124,18 @@ type ActivityWork struct {
 }
 
 func (a *Agent) Activity() Activity {
+	executable, isInstalled := a.Running()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	out := Activity{
-		Version:   Version,
-		Connected: a.conn != nil,
-		Work:      []ActivityWork{},
-		Preparing: []string{},
-		Draining:  a.drainingLocked(),
-		Idle:      len(a.assignments) == 0 && len(a.preparing) == 0 && a.refreshing == 0,
+		Version:    Version,
+		Executable: executable,
+		Installed:  isInstalled,
+		Connected:  a.conn != nil,
+		Work:       []ActivityWork{},
+		Preparing:  []string{},
+		Draining:   a.drainingLocked(),
+		Idle:       len(a.assignments) == 0 && len(a.preparing) == 0 && a.refreshing == 0,
 	}
 	for _, as := range a.assignments {
 		kind := "job"
@@ -153,6 +160,8 @@ func (a *Agent) Activity() Activity {
 //	GET  /v1/status   what the agent is doing (Activity)
 //	POST /v1/drain    stop taking new work
 //	POST /v1/resume   take work again
+//	POST /v1/switch   become another build once idle: {"path": "...", "argv": [...]}; no path
+//	                  means the installed agent
 //
 // Nothing outside the host reaches it. Draining a host is its owner's to decide, as its
 // policy is.
@@ -168,6 +177,21 @@ func (a *Agent) ControlHandler() http.Handler {
 			a.Drain(DrainOwner)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/resume":
 			a.Resume(DrainOwner)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/switch":
+			var req struct {
+				Path string   `json:"path"`
+				Argv []string `json:"argv"`
+			}
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+				http.Error(w, `{"error":"expected a JSON object"}`, http.StatusBadRequest)
+				return
+			}
+			if err := a.RequestSwitch(req.Path, req.Argv); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
 		default:
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return

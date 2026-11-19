@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -108,6 +109,9 @@ type Agent struct {
 	refreshing  int             // images being refreshed now
 	draining    map[string]bool // the reasons no new work is taken; see drain.go
 	runCtx      context.Context // Run's context, for work started outside a message
+	upgrade     *Upgrade        // how this agent switches versions, once WatchUpgrade runs
+	switches    chan switchTo   // a build its owner asked it to become
+	local       bool            // true for a build its owner put in the service's place
 	conn        *websocket.Conn
 	connCtx     context.Context
 	wg          sync.WaitGroup
@@ -134,6 +138,8 @@ func New(o Options) *Agent {
 		ready:       map[string]bool{},
 		preparing:   map[string]bool{},
 		draining:    map[string]bool{},
+		switches:    make(chan switchTo, 1),
+		local:       os.Getenv(localEnv) != "",
 		isolationOK: o.Executor.NetworkIsolationAvailable(),
 	}
 }

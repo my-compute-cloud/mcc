@@ -288,7 +288,8 @@ func TestRunnerExitBeforeJobIsAFailure(t *testing.T) {
 	<-cp.hellos
 	cp.send(startMsg("e1"))
 	m := cp.next(status("e1", "failed"))
-	if m["reason"] != "runner exited with code 1 before taking a job" {
+	// The reason carries what the runner said last, which is what tells its owner why.
+	if m["reason"] != "runner exited with code 1 before taking a job; it said: √ Connected to GitHub" {
 		t.Fatalf("reason %v", m["reason"])
 	}
 }

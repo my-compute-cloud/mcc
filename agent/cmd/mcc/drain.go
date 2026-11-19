@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -48,6 +50,11 @@ var errNoAgent = errors.New("the agent is not running on this host")
 
 // askAgent sends one request to the agent running with this state directory.
 func askAgent(ctx context.Context, dir, method, path string) (agent.Activity, error) {
+	return tellAgent(ctx, dir, method, path, nil)
+}
+
+// tellAgent is askAgent with something to say.
+func tellAgent(ctx context.Context, dir, method, path string, body any) (agent.Activity, error) {
 	var out agent.Activity
 	socket := controlSocket(dir)
 	client := &http.Client{Transport: &http.Transport{
@@ -56,7 +63,15 @@ func askAgent(ctx context.Context, dir, method, path string) (agent.Activity, er
 		},
 	}}
 	defer client.CloseIdleConnections()
-	req, err := http.NewRequestWithContext(ctx, method, "http://mcc"+path, nil)
+	var payload io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return out, err
+		}
+		payload = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://mcc"+path, payload)
 	if err != nil {
 		return out, err
 	}
@@ -69,6 +84,12 @@ func askAgent(ctx context.Context, dir, method, path string) (agent.Activity, er
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+		}
+		if json.NewDecoder(res.Body).Decode(&e) == nil && e.Error != "" {
+			return out, errors.New(e.Error)
+		}
 		return out, fmt.Errorf("the agent answered %s; it may be an older version", res.Status)
 	}
 	return out, json.NewDecoder(res.Body).Decode(&out)
@@ -135,5 +156,48 @@ func drain(verb string, args []string) error {
 	default:
 		fmt.Printf("This host takes no new work; %s. `mcc drain --wait` waits for that; `mcc resume` undoes it.\n", describeWork(act))
 	}
+	return nil
+}
+
+// use is `mcc use`: run another build of the agent in the service's place, or go back to the
+// installed one. The agent that is running finishes what it has, then becomes the other: the
+// service is not stopped, so nothing has to be restarted or given permission, and the build
+// logs where the service does.
+func use(args []string) error {
+	const usage = "usage: mcc use PATH [--debug] | mcc use --installed [--debug]"
+	fs := flag.NewFlagSet("use", flag.ExitOnError)
+	back := fs.Bool("installed", false, "go back to the agent the service starts")
+	debug := fs.Bool("debug", false, "start it with debug logging")
+	rest := parse(fs, args)
+	if (*back && len(rest) != 0) || (!*back && len(rest) != 1) {
+		return errors.New(usage)
+	}
+	dir, err := config.Dir()
+	if err != nil {
+		return err
+	}
+	req := map[string]any{}
+	what := "the installed agent"
+	if !*back {
+		path, err := filepath.Abs(rest[0])
+		if err != nil {
+			return err
+		}
+		argv := []string{path, "run"}
+		if *debug {
+			argv = append(argv, "-v")
+		}
+		req["path"], req["argv"] = path, argv
+		what = path
+	} else if *debug {
+		return errors.New("the installed agent logs what its policy says: set \"log_level\": \"debug\" there, then `mcc use --installed`")
+	}
+	ctx, stop := interruptible()
+	defer stop()
+	act, err := tellAgent(ctx, dir, http.MethodPost, "/v1/switch", req)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("The agent will become %s once it is idle; %s. `mcc check` says when it has.\n", what, describeWork(act))
 	return nil
 }

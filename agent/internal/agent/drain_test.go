@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -178,6 +179,66 @@ func TestWorkHoldsANewerAgentBackOnlyAsLongAsThePolicyAllows(t *testing.T) {
 	// What was left was stopped first, as a stop of the service would.
 	if f.Running() != 0 {
 		t.Fatalf("switched with %d VMs still running", f.Running())
+	}
+}
+
+func TestTheOwnerCanPutAnotherBuildInTheServicesPlaceAndGoBack(t *testing.T) {
+	f := fake.New()
+	f.Block = true
+	a, cp, ctx := startOwned(t, f)
+	dir := t.TempDir()
+	service, mine := filepath.Join(dir, "mcc-agent"), filepath.Join(dir, "my-build")
+	installAgent(t, service, "installed")
+	installAgent(t, mine, "mine")
+	type started struct {
+		path  string
+		argv  []string
+		local bool
+	}
+	execd := make(chan started, 4)
+	go a.WatchUpgrade(ctx, Upgrade{
+		Path: service, Argv: []string{service}, Every: 10 * time.Millisecond,
+		Exec: func(p string, argv, env []string) error {
+			execd <- started{p, argv, slices.Contains(env, "MCC_LOCAL_BUILD=1")}
+			return errors.New("the test goes on in this process")
+		},
+	})
+	time.Sleep(30 * time.Millisecond)
+
+	if err := a.RequestSwitch("my-build", nil); err == nil {
+		t.Fatal("took a path that says nothing about where")
+	}
+	if err := a.RequestSwitch(filepath.Join(dir, "missing"), nil); err == nil {
+		t.Fatal("took a program that is not there")
+	}
+
+	// It waits for running work, as an upgrade does.
+	cp.send(startMsg("s1"))
+	cp.next(status("s1", "running"))
+	if err := a.RequestSwitch(mine, []string{mine, "run", "-v"}); err != nil {
+		t.Fatal(err)
+	}
+	cp.next(capacityWith(false, "upgrade"))
+	select {
+	case <-execd:
+		t.Fatal("switched while work was running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cp.send(map[string]any{"type": "stop", "assignment_id": "s1"})
+	cp.next(status("s1", "finished"))
+	got := <-execd
+	if got.path != mine || !slices.Equal(got.argv, []string{mine, "run", "-v"}) || !got.local {
+		t.Fatalf("started %+v", got)
+	}
+
+	// And back: the installed agent is started as the service starts it, and is not marked.
+	cp.next(capacityWith(true, ""))
+	if err := a.RequestSwitch("", nil); err != nil {
+		t.Fatal(err)
+	}
+	got = <-execd
+	if got.path != service || !slices.Equal(got.argv, []string{service}) || got.local {
+		t.Fatalf("went back to %+v", got)
 	}
 }
 

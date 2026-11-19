@@ -137,6 +137,9 @@ type Policy struct {
 	AllowedWorkloads []string `json:"allowed_workloads"`
 	// ScriptTimeoutSeconds is the longest a script may run. Zero means an hour.
 	ScriptTimeoutSeconds int `json:"script_timeout_seconds"`
+	// LogLevel is "debug" to have the agent log everything, including each line a runner
+	// prints before it takes a job. Empty or "info" is the usual amount.
+	LogLevel string `json:"log_level,omitempty"`
 	// UpgradeWaitMinutes is how long running work may hold back a switch to a newer agent
 	// that has been installed. After it the agent switches anyway and what is left is
 	// stopped. Absent means six hours; 0 means as long as it takes.
@@ -392,6 +395,9 @@ func LoadPolicy(dir string) (Policy, error) {
 func (p Policy) Validate() error {
 	if p.MaxVMs < 0 {
 		return fmt.Errorf("policy: max_vms must not be negative")
+	}
+	if p.LogLevel != "" && p.LogLevel != "info" && p.LogLevel != "debug" {
+		return fmt.Errorf("policy: log_level must be info or debug")
 	}
 	if p.UpgradeWaitMinutes != nil && *p.UpgradeWaitMinutes < 0 {
 		return fmt.Errorf("policy: upgrade_wait_minutes must not be negative")

@@ -66,6 +66,8 @@ func main() {
 		err = check(os.Args[2:])
 	case "drain", "resume":
 		err = drain(os.Args[1], os.Args[2:])
+	case "use":
+		err = use(os.Args[2:])
 	case "logs":
 		err = logs(os.Args[2:])
 	case "pin":
@@ -114,6 +116,7 @@ This machine, as a host:
   enroll [--pool POOL]                   register it (signed in), or: enroll --server URL TOKEN
   check                                  what is wrong with this host
   drain [--wait] | resume                take no new work, letting what runs finish; undo it
+  use PATH [--debug] | use --installed   run another build of the agent in the service's place
   policy [check [FILE]]                  what this host allows
   run                                    connect and run work (normally as a service)
   logs [-f] TASK                         what a task printed
@@ -210,9 +213,11 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	verbose := fs.Bool("v", false, "debug logging")
 	_ = fs.Parse(args)
-	level := slog.LevelInfo
+	// Debug logging is asked for with -v, or lastingly with "log_level": "debug" in the policy.
+	// The level can change once the policy has been read, below.
+	level := new(slog.LevelVar)
 	if *verbose {
-		level = slog.LevelDebug
+		level.Set(slog.LevelDebug)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
@@ -244,6 +249,10 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	if policy.LogLevel == "debug" {
+		level.Set(slog.LevelDebug)
+	}
+	log.Debug("debug logging is on: everything is logged, including each line a runner prints before it takes a job")
 
 	ex, err := newExecutor(dir, policy, log)
 	if err != nil {
@@ -370,7 +379,8 @@ func run(args []string) error {
 			log.Warn("the agent cannot be asked what it is doing, or to drain", "err", err)
 		}
 	}()
-	// A newer agent installed where this one was started from takes over once this one is idle.
+	// A newer agent installed where this one was started from takes over once this one is idle,
+	// and so does one its owner points it at with `mcc use`.
 	go a.WatchUpgrade(ctx, upgradeFrom(policy))
 	log.Info("starting agent", "version", agent.Version, "host", state.HostID, "server", state.ServerURL)
 	return a.Run(ctx)

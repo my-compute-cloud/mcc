@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,7 +44,9 @@ SHARED="/Volumes/My Shared Files/` + runnerShare + `"
 RUNNER="$HOME/actions-runner"
 if [ -x "$SHARED/run.sh" ]; then
   rm -rf "$RUNNER.mcc"
-  cp -R "$SHARED" "$RUNNER.mcc"
+  # Without extended attributes (-X): the share cannot give those of a symbolic link, and
+  # cp fails on each one it cannot copy. The runner needs none of them.
+  cp -RX "$SHARED" "$RUNNER.mcc"
   RUNNER="$RUNNER.mcc"
 fi
 # The owner's cache for this job, if any, and the image's own say on what to do with it:
@@ -644,16 +647,26 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 // watches its output for the job being taken.
 func (a *Agent) runRunner(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger, ex executor.Executor, h executor.Handle, script string, env []string) (bool, string) {
 	var busy atomic.Bool
+	// What the runner said last before any job, kept to explain a runner that never took one.
+	var last lastLines
+	read := make(chan struct{})
 	pr, pw := io.Pipe()
 	go func() {
+		defer close(read)
 		sc := bufio.NewScanner(pr)
+		sc.Buffer(make([]byte, 64<<10), 1<<20)
 		for sc.Scan() {
 			line := sc.Text()
 			if strings.Contains(line, jobTakenMarker) && !busy.Swap(true) {
 				lg.Info("runner took a job")
 			}
+			if !busy.Load() {
+				last.add(line)
+			}
 			lg.Debug("runner", "line", line)
 		}
+		// A line too long to scan must not leave the workload blocked on a full pipe.
+		_, _ = io.Copy(io.Discard, pr)
 	}()
 
 	// Stop a runner that never gets a job, even if the control plane is unreachable.
@@ -677,6 +690,7 @@ func (a *Agent) runRunner(ctx context.Context, as *assignment, m protocol.Start,
 		Output: pw,
 	})
 	pw.Close()
+	<-read
 
 	switch {
 	case a.stopReason(as) != "":
@@ -684,10 +698,50 @@ func (a *Agent) runRunner(ctx context.Context, as *assignment, m protocol.Start,
 	case err != nil:
 		return busy.Load(), fmt.Sprintf("running workload: %v", err)
 	case code != 0 && !busy.Load():
-		return false, fmt.Sprintf("runner exited with code %d before taking a job", code)
+		// Nothing of a job's is in this: no job was taken. It is the runner's own words, and
+		// without them the failure says nothing anyone can act on.
+		said := last.String()
+		lg.Warn("the runner exited before taking a job", "code", code, "said", said)
+		if said == "" {
+			return false, fmt.Sprintf("runner exited with code %d before taking a job", code)
+		}
+		return false, fmt.Sprintf("runner exited with code %d before taking a job; it said: %s", code, said)
 	default:
 		return true, ""
 	}
+}
+
+// lastLines keeps the last few lines of output that say anything.
+type lastLines struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+const (
+	keptLines     = 4
+	keptLineBytes = 240
+)
+
+func (l *lastLines) add(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	if len(line) > keptLineBytes {
+		line = line[:keptLineBytes] + "..."
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, line)
+	if len(l.lines) > keptLines {
+		l.lines = l.lines[len(l.lines)-keptLines:]
+	}
+}
+
+func (l *lastLines) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, " | ")
 }
 
 func (a *Agent) finish(as *assignment, lg interface{ Info(string, ...any) }, ok bool, reason string) {

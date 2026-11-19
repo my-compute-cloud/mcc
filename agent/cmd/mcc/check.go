@@ -202,6 +202,10 @@ func inspect(ctx context.Context, dir string) *report {
 				default:
 					r.ok("activity", "Agent %s: %s.", act.Version, describeWork(act))
 				}
+				if !act.Installed {
+					r.warn("local_build", fmt.Sprintf("The agent running is a build put in the service's place: %s.", act.Executable),
+						"`mcc use --installed` goes back to the installed agent. So does the next update that changes it.")
+				}
 			}
 		} else {
 			fix := "Start it: `mcc run`, or start its service (launchd: `launchctl kickstart -k gui/$(id -u)/org.nixos.mcc-agent`; systemd: `systemctl start mcc-agent`)."
@@ -363,6 +367,9 @@ func describePolicy(p config.Policy) []string {
 	}
 	if p.ActiveHours != "" {
 		out = append(out, "Only during "+p.ActiveHours+".")
+	}
+	if p.LogLevel == "debug" {
+		out = append(out, "Debug logging.")
 	}
 	if w := p.UpgradeWait(); w > 0 {
 		out = append(out, fmt.Sprintf("A newer agent waits up to %s for running work before it takes over.", w))
