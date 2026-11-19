@@ -151,6 +151,8 @@ type Capacity struct {
 	Tasks []TaskCapacity `json:"tasks,omitempty"`
 	// True if this host's owner lets free-form scripts run in its VMs. Absent or false otherwise
 	Scripts bool `json:"scripts,omitempty"`
+	// Why this host takes no new work although it could: "upgrade" while a newer agent waits for it to be idle, "owner" when its owner asked. Absent or empty otherwise
+	Draining string `json:"draining,omitempty"`
 	// host:port where this host gives a task's output to a caller that shows the task's secret. Absent unless its owner turned that on
 	OutputAddress string `json:"output_address,omitempty"`
 	// The public key of the host's output listener: base64 of its SubjectPublicKeyInfo. Present whenever the host keeps task output, whether or not it listens; a caller reading through the relay agrees an encryption key with it

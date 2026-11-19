@@ -137,6 +137,10 @@ type Policy struct {
 	AllowedWorkloads []string `json:"allowed_workloads"`
 	// ScriptTimeoutSeconds is the longest a script may run. Zero means an hour.
 	ScriptTimeoutSeconds int `json:"script_timeout_seconds"`
+	// UpgradeWaitMinutes is how long running work may hold back a switch to a newer agent
+	// that has been installed. After it the agent switches anyway and what is left is
+	// stopped. Absent means six hours; 0 means as long as it takes.
+	UpgradeWaitMinutes *int `json:"upgrade_wait_minutes,omitempty"`
 	// TaskOutput is how much of what tasks print is kept on this host, and for how long.
 	TaskOutput TaskOutput `json:"task_output"`
 }
@@ -231,6 +235,15 @@ func (p Policy) WorkloadAllowed(kind string) bool {
 }
 
 // ScriptTimeout is the longest a script may run.
+// UpgradeWait is how long running work may hold back a switch to a newer agent. Zero means
+// as long as it takes.
+func (p Policy) UpgradeWait() time.Duration {
+	if p.UpgradeWaitMinutes == nil {
+		return 6 * time.Hour
+	}
+	return time.Duration(*p.UpgradeWaitMinutes) * time.Minute
+}
+
 func (p Policy) ScriptTimeout() time.Duration {
 	if p.ScriptTimeoutSeconds <= 0 {
 		return time.Hour
@@ -379,6 +392,9 @@ func LoadPolicy(dir string) (Policy, error) {
 func (p Policy) Validate() error {
 	if p.MaxVMs < 0 {
 		return fmt.Errorf("policy: max_vms must not be negative")
+	}
+	if p.UpgradeWaitMinutes != nil && *p.UpgradeWaitMinutes < 0 {
+		return fmt.Errorf("policy: upgrade_wait_minutes must not be negative")
 	}
 	if p.ActiveHours != "" {
 		if _, _, err := parseHours(p.ActiveHours); err != nil {

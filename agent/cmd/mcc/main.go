@@ -64,6 +64,8 @@ func main() {
 		}
 	case "check":
 		err = check(os.Args[2:])
+	case "drain", "resume":
+		err = drain(os.Args[1], os.Args[2:])
 	case "logs":
 		err = logs(os.Args[2:])
 	case "pin":
@@ -111,6 +113,7 @@ You, signed in:
 This machine, as a host:
   enroll [--pool POOL]                   register it (signed in), or: enroll --server URL TOKEN
   check                                  what is wrong with this host
+  drain [--wait] | resume                take no new work, letting what runs finish; undo it
   policy [check [FILE]]                  what this host allows
   run                                    connect and run work (normally as a service)
   logs [-f] TASK                         what a task printed
@@ -361,8 +364,37 @@ func run(args []string) error {
 		Log:           log,
 		Resources:     resources(policy),
 	})
+	// The owner's way in: what the agent is doing, and `mcc drain`.
+	go func() {
+		if err := serveControl(ctx, controlSocket(dir), a.ControlHandler()); err != nil {
+			log.Warn("the agent cannot be asked what it is doing, or to drain", "err", err)
+		}
+	}()
+	// A newer agent installed where this one was started from takes over once this one is idle.
+	go a.WatchUpgrade(ctx, upgradeFrom(policy))
 	log.Info("starting agent", "version", agent.Version, "host", state.HostID, "server", state.ServerURL)
 	return a.Run(ctx)
+}
+
+// upgradeFrom says where a newer agent would appear and how to start it. A service that
+// starts the agent through a launcher names the launcher in MCC_UPGRADE_PATH; otherwise it is
+// this program's own file, which an installer replaces.
+func upgradeFrom(policy config.Policy) agent.Upgrade {
+	u := agent.Upgrade{Wait: policy.UpgradeWait()}
+	// How often to look, for tests that cannot wait half a minute.
+	if d, err := time.ParseDuration(os.Getenv("MCC_UPGRADE_CHECK")); err == nil && d > 0 {
+		u.Every = d
+	}
+	if p := os.Getenv("MCC_UPGRADE_PATH"); p != "" {
+		u.Path, u.Argv = p, []string{p}
+		return u
+	}
+	self, err := os.Executable()
+	if err != nil {
+		self = os.Args[0]
+	}
+	u.Path, u.Argv = self, append([]string{self}, os.Args[1:]...)
+	return u
 }
 
 // outputKeyPath is where the host's output key is kept: the key callers pin, for the listener

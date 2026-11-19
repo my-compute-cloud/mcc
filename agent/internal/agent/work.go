@@ -443,6 +443,14 @@ func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
 	}
 	a.mu.Unlock()
 
+	// A start that was already on its way when the agent began to drain. Refused for want of
+	// capacity, which is the refusal the control plane takes elsewhere.
+	if why := a.Draining(); why != "" {
+		a.log.Info("refusing start: draining", "assignment", m.AssignmentID, "why", why)
+		a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: this host is draining (" + why + ")", Code: codeRefusedCapacity})
+		return
+	}
+
 	if reason, code := a.policyCheck(m); reason != "" {
 		a.log.Warn("refusing start", "assignment", m.AssignmentID, "reason", reason)
 		a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: " + reason, Code: code})

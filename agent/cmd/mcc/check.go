@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/my-compute-cloud/mcc/agent/internal/agent"
 	"github.com/my-compute-cloud/mcc/agent/internal/api"
 	"github.com/my-compute-cloud/mcc/agent/internal/config"
 )
@@ -190,6 +191,18 @@ func inspect(ctx context.Context, dir string) *report {
 	if serr == nil {
 		if agentRunning(dir) {
 			r.ok("agent_running", "The agent is running.")
+			// What it has in hand, which is what an upgrade or a shutdown would have to wait for.
+			if act, err := askAgent(ctx, dir, http.MethodGet, "/v1/status"); err == nil {
+				switch act.Draining {
+				case agent.DrainUpgrade:
+					r.warn("draining_for_upgrade", fmt.Sprintf("A newer agent is installed. This one takes no new work and switches to it once idle; %s.", describeWork(act)),
+						"Nothing to do: it switches by itself. upgrade_wait_minutes in the policy limits how long work may hold it back.")
+				case agent.DrainOwner:
+					r.warn("draining", fmt.Sprintf("This host was told to drain, so it takes no new work; %s.", describeWork(act)), "`mcc resume` lets it take work again.")
+				default:
+					r.ok("activity", "Agent %s: %s.", act.Version, describeWork(act))
+				}
+			}
 		} else {
 			fix := "Start it: `mcc run`, or start its service (launchd: `launchctl kickstart -k gui/$(id -u)/org.nixos.mcc-agent`; systemd: `systemctl start mcc-agent`)."
 			if p := serviceLog(); p != "" {
@@ -350,6 +363,11 @@ func describePolicy(p config.Policy) []string {
 	}
 	if p.ActiveHours != "" {
 		out = append(out, "Only during "+p.ActiveHours+".")
+	}
+	if w := p.UpgradeWait(); w > 0 {
+		out = append(out, fmt.Sprintf("A newer agent waits up to %s for running work before it takes over.", w))
+	} else {
+		out = append(out, "A newer agent waits for running work for as long as it takes.")
 	}
 	if p.TaskOutput.Listen != "" {
 		out = append(out, "Serves task output to other machines on "+p.TaskOutput.Listen+".")

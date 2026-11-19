@@ -19,10 +19,20 @@ let
   home = "/Users/${cfg.user}";
   policyFile = pkgs.writeText "mcc-policy.json" (builtins.toJSON cfg.policy);
 
-  # The service's program. macOS shows the name of this file to the user, in the "can run in
-  # the background" notice and in Login Items, so it is a file called mcc-agent, and launchd is
-  # pointed at it through the system profile: a path that stays the same from one version to
-  # the next, where a store path would put a hash in front of the user and change every time.
+  # Where launchd finds the agent's launcher: in the system profile, under a name that does
+  # not change from one version to the next.
+  #
+  #   - The service's definition is then the same for every version, so nix-darwin, which
+  #     reloads a service only when its definition differs, leaves a running agent alone. An
+  #     update installs the new agent; the running one finishes its work and then replaces
+  #     itself with what this path leads to (MCC_UPGRADE_PATH, docs/agent.md).
+  #   - It is the profile and not /run/current-system because of when each is switched. The
+  #     profile is set before activation runs; /run/current-system only after services have
+  #     been loaded, when it still leads to the old system or, on a first install, nowhere.
+  #   - macOS shows the file's name to the user, in the "can run in the background" notice
+  #     and in Login Items: mcc-agent, where a store path would be named by its hash.
+  launcher = "/nix/var/nix/profiles/system/sw/bin/mcc-agent";
+
   start = pkgs.writeShellScriptBin "mcc-agent" ''
     set -euo pipefail
     export PATH=${
@@ -99,11 +109,14 @@ in
       start
     ];
 
+    # An update that changes the agent restarts nothing, so it says what will happen.
+    system.activationScripts.postActivation.text = ''
+      echo "mcc: the agent is not restarted by this. If a newer one was installed, the running one switches to it once it is idle; \`mcc check\` says where that stands." >&2
+    '';
+
     launchd.user.agents.mcc-agent.serviceConfig = {
-      ProgramArguments = [ "/run/current-system/sw/bin/mcc-agent" ];
-      # The path above no longer changes with the version, so this does: nix-darwin restarts
-      # an agent whose definition changed, and a new agent should replace the old one.
-      EnvironmentVariables.MCC_AGENT_BUILD = "${start}";
+      ProgramArguments = [ launcher ];
+      EnvironmentVariables.MCC_UPGRADE_PATH = launcher;
       RunAtLoad = true;
       KeepAlive.SuccessfulExit = false;
       ThrottleInterval = 30;

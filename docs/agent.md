@@ -98,7 +98,40 @@ findings, each with a `code` that does not change. Signed out, it looks at this 
 `mcc policy check [FILE]` says in words what a policy file permits, before the agent reads it.
 
 One agent runs per state directory: it holds a lock on `agent.lock` there, which is how
-`mcc check` knows whether it is running.
+`mcc check` knows whether it is running. It also says what the agent has in hand, which is
+what an upgrade would wait for.
+
+## Upgrading, and draining a host
+
+Installing a newer agent does not stop the one that is running. The running agent notices
+that a different one is installed where it was started from, and then:
+
+1. It **drains**: it tells the control plane it takes no new work, and work that was already
+   on its way to it is taken elsewhere.
+2. It lets what it has finish: jobs, tasks, and an image that is being downloaded.
+3. Once nothing is running it replaces itself with the installed agent, in place. The service
+   manager sees nothing happen, so nothing is restarted and no job is lost to an update.
+
+Work can hold this back for six hours, or for what `upgrade_wait_minutes` says in the host's
+policy; after that the agent switches anyway and what is left is stopped. `0` waits as long
+as it takes. `mcc check` and `mcc status` say when a host is draining and why.
+
+This is the same however the agent was installed. The nix-darwin module starts the agent
+through a launcher in the system profile and names it in `MCC_UPGRADE_PATH`, so a system
+update that changes the agent or its policy is picked up this way and never restarts it.
+Elsewhere the agent watches its own file, which the install script replaces. A rollback is
+picked up like an upgrade.
+
+Stopping the service is different, and still immediate: `launchctl bootout`, `systemctl stop`
+and a shutdown stop what is running. To empty a host first:
+
+```bash
+mcc drain --wait
+```
+
+takes no new work and returns once nothing is running; `mcc resume` undoes it. Only the
+host's owner can drain it: the agent listens for this on `agent.sock` in its state directory,
+which only its own account can open.
 
 ## Local policy
 
@@ -130,6 +163,7 @@ The control plane cannot override these. A `start` that breaks the policy is ans
 | `tasks` | none | Commands the control plane may ask this host to run, by name; see [below](#tasks) |
 | `allowed_workloads` | `["github-runner"]` | The kinds of work this host takes. Add `"script"` to let callers run their own shell scripts in its VMs; see [below](#scripts-in-vms) |
 | `script_timeout_seconds` | 3600 | The longest a script may run. A request can ask for less, not more |
+| `upgrade_wait_minutes` | 360 | How long running work may hold back a switch to a newer agent that has been installed; 0 for as long as it takes. See [above](#upgrading-and-draining-a-host) |
 | `task_output` | 64 MB a run, 1 GB in all, 7 days | How much of what tasks print is kept on this host; see [below](#task-output) |
 
 ## Xcode from the host

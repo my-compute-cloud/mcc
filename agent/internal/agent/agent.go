@@ -105,6 +105,9 @@ type Agent struct {
 	images      map[string]protocol.ImageSpec // by name, as configured by the control plane
 	ready       map[string]bool               // image name -> prepared
 	preparing   map[string]bool
+	refreshing  int             // images being refreshed now
+	draining    map[string]bool // the reasons no new work is taken; see drain.go
+	runCtx      context.Context // Run's context, for work started outside a message
 	conn        *websocket.Conn
 	connCtx     context.Context
 	wg          sync.WaitGroup
@@ -130,6 +133,7 @@ func New(o Options) *Agent {
 		images:      map[string]protocol.ImageSpec{},
 		ready:       map[string]bool{},
 		preparing:   map[string]bool{},
+		draining:    map[string]bool{},
 		isolationOK: o.Executor.NetworkIsolationAvailable(),
 	}
 }
@@ -148,6 +152,9 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log.Warn("network isolation unavailable: " + why)
 		}
 	}
+	a.mu.Lock()
+	a.runCtx = ctx
+	a.mu.Unlock()
 	a.cleanupLeftovers(ctx)
 	go a.refreshLoop(ctx)
 
@@ -532,6 +539,9 @@ func (a *Agent) hostSlots() int {
 }
 
 func (a *Agent) accepting() bool {
+	if a.Draining() != "" {
+		return false
+	}
 	if !a.o.Policy.Active(a.o.Now()) {
 		return false
 	}
@@ -615,7 +625,8 @@ func (a *Agent) sendCapacity() {
 		Type: protocol.TypeCapacity, SlotsTotal: total, SlotsFree: free, ImagesReady: ready, Accepting: a.accepting(), Guests: guests,
 		HostSlotsTotal: a.hostSlots(), HostSlotsFree: a.freeHostSlots(), Tasks: a.declaredTasks(),
 		OutputAddress: a.o.OutputAddress, OutputPin: a.o.OutputPin, OutputKey: a.outputKey(),
-		Scripts: a.o.Policy.WorkloadAllowed("script"),
+		Scripts:  a.o.Policy.WorkloadAllowed("script"),
+		Draining: a.Draining(),
 	})
 }
 
@@ -637,15 +648,36 @@ func (a *Agent) applyConfig(ctx context.Context, pools []protocol.PoolConfig, im
 			a.log.Warn("image not allowed by local policy; not preparing it", "image", img.Name, "source", img.Source)
 			continue
 		}
+	}
+	a.prepareMissing(ctx)
+	_ = pools
+}
+
+// prepareMissing starts fetching each image the control plane wants, the owner allows and the
+// host does not have. While draining it starts nothing: a download begun now would only hold
+// up what the agent is draining for.
+func (a *Agent) prepareMissing(ctx context.Context) {
+	a.mu.Lock()
+	images := make([]protocol.ImageSpec, 0, len(a.images))
+	for _, img := range a.images {
+		images = append(images, img)
+	}
+	a.mu.Unlock()
+	for _, img := range images {
+		if !a.o.Policy.ImageAllowed(img.Source) {
+			continue
+		}
 		if a.o.Executor.Ready(ctx, img) {
 			a.mu.Lock()
 			a.ready[img.Name] = true
 			a.mu.Unlock()
 			continue
 		}
+		if a.Draining() != "" {
+			continue
+		}
 		a.prepareAsync(ctx, img)
 	}
-	_ = pools
 }
 
 func (a *Agent) prepareAsync(ctx context.Context, img protocol.ImageSpec) {
@@ -695,7 +727,19 @@ func (a *Agent) refreshLoop(ctx context.Context) {
 		}
 		a.mu.Unlock()
 		for _, img := range imgs {
-			if err := a.o.Executor.Refresh(ctx, img); err != nil {
+			// A refresh can wait; what the agent is draining for should not wait for it.
+			a.mu.Lock()
+			if a.drainingLocked() != "" {
+				a.mu.Unlock()
+				continue
+			}
+			a.refreshing++
+			a.mu.Unlock()
+			err := a.o.Executor.Refresh(ctx, img)
+			a.mu.Lock()
+			a.refreshing--
+			a.mu.Unlock()
+			if err != nil {
 				a.log.Warn("refreshing image failed", "image", img.Name, "err", err)
 			}
 		}

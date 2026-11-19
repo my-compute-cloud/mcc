@@ -129,6 +129,7 @@
         "host_slots_free": { "type": "integer" },
         "tasks": { "type": "array", "items": { "$ref": "#/$defs/TaskCapacity" }, "description": "Tasks this host's owner has declared. Absent if none" },
         "scripts": { "type": "boolean", "description": "True if this host's owner lets free-form scripts run in its VMs. Absent or false otherwise" },
+        "draining": { "type": "string", "description": "Why this host takes no new work although it could: \"upgrade\" while a newer agent waits for it to be idle, \"owner\" when its owner asked. Absent or empty otherwise" },
         "output_address": { "type": "string", "description": "host:port where this host gives a task's output to a caller that shows the task's secret. Absent unless its owner turned that on" },
         "output_key": { "type": "string", "description": "The public key of the host's output listener: base64 of its SubjectPublicKeyInfo. Present whenever the host keeps task output, whether or not it listens; a caller reading through the relay agrees an encryption key with it" },
         "output_pin": { "type": "string", "description": "SHA-256, in base64, of the public key of the listener at output_address. A caller connects only to a server that has that key" }
