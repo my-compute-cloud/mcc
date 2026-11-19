@@ -45,8 +45,24 @@ their own.
 
 ## Enroll
 
-Add the host from the dashboard at <https://mycompute.cloud/dashboard>, which gives you a single-use command, then on
-the host:
+Sign in on the host, then enroll it into a pool. Nothing is copied or pasted:
+
+```bash
+mcc auth login
+```
+
+```bash
+mcc enroll --pool <pool>
+```
+
+`mcc auth login` prints a short code and opens <https://mycompute.cloud/cli>, where you approve
+it while signed in. It works over SSH too: open the address it prints on any machine. The
+sign-in is yours, not the host's. It is kept in `~/.config/mcc/credentials.json`, readable only
+by you, lasts 90 days from its last use, and `mcc auth logout` ends it. `--read-only` asks for
+a sign-in that can see everything and change nothing.
+
+Without signing in, add the host from the dashboard at <https://mycompute.cloud/dashboard>,
+which gives you a single-use command:
 
 ```bash
 mcc enroll --server https://<control plane> <token>
@@ -67,7 +83,27 @@ State lives in `~/Library/Application Support/mcc` on a Mac and in `~/.config/mc
 | `runner/`, `runner-linux/` | Cached GitHub Actions runner for macOS and for Linux guests, shared read-only into VMs |
 | `kvm/` | On a Linux host: image bases, the files of running VMs, and the runner as a disk image |
 
+## Checking a host
+
+```bash
+mcc check
+```
+
+says what is wrong with this host and what to do about it: whether it is enrolled, whether
+the agent is running and connected, whether it can run VMs, which pools it is in, and whether
+its own policy admits each pool's image and the GitHub accounts that send jobs. It exits with a
+failure if anything stops work from running, and `--json` gives the same as a list of
+findings, each with a `code` that does not change. Signed out, it looks at this machine only.
+
+`mcc policy check [FILE]` says in words what a policy file permits, before the agent reads it.
+
+One agent runs per state directory: it holds a lock on `agent.lock` there, which is how
+`mcc check` knows whether it is running.
+
 ## Local policy
+
+Nothing outside the host can change its policy: not the API, not `mcc` signed in from another
+machine, not an MCP client. Whoever can write the policy file decides what the host accepts.
 
 The control plane cannot override these. A `start` that breaks the policy is answered with a
 `failed` status and the reason. `mcc policy` prints the effective policy.

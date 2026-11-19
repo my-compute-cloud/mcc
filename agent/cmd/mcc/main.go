@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/my-compute-cloud/mcc/agent/internal/agent"
+	"github.com/my-compute-cloud/mcc/agent/internal/api"
 	"github.com/my-compute-cloud/mcc/agent/internal/cache"
 	"github.com/my-compute-cloud/mcc/agent/internal/config"
 	"github.com/my-compute-cloud/mcc/agent/internal/executor"
@@ -56,11 +57,35 @@ func main() {
 	case "run":
 		err = run(os.Args[2:])
 	case "policy":
-		err = showPolicy()
+		if len(os.Args) > 2 && os.Args[2] == "check" {
+			err = policyCheck(os.Args[3:])
+		} else {
+			err = showPolicy()
+		}
+	case "check":
+		err = check(os.Args[2:])
 	case "logs":
 		err = logs(os.Args[2:])
 	case "pin":
 		err = showPin()
+	case "auth":
+		err = auth(os.Args[2:])
+	case "status":
+		err = status(os.Args[2:])
+	case "image":
+		err = image(os.Args[2:])
+	case "pool":
+		err = pool(os.Args[2:])
+	case "host":
+		err = host(os.Args[2:])
+	case "task":
+		err = task(os.Args[2:])
+	case "webhook":
+		err = webhook(os.Args[2:])
+	case "token":
+		err = token(os.Args[2:])
+	case "github":
+		err = github(os.Args[2:])
 	case "version":
 		fmt.Println(agent.Version)
 	default:
@@ -73,18 +98,39 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: mcc enroll --server URL [--name NAME] TOKEN | mcc run | mcc policy | mcc logs [-f] TASK | mcc pin | mcc version")
+	fmt.Fprint(os.Stderr, `usage: mcc COMMAND
+
+You, signed in:
+  auth login | logout | status | token   sign in through the browser
+  status                                 pools, hosts and what is wrong
+  image | pool | host                    manage them
+  task | webhook                         run work and see how it went
+  token                                  API tokens
+  github                                 which GitHub accounts send jobs here
+
+This machine, as a host:
+  enroll [--pool POOL]                   register it (signed in), or: enroll --server URL TOKEN
+  check                                  what is wrong with this host
+  policy [check [FILE]]                  what this host allows
+  run                                    connect and run work (normally as a service)
+  logs [-f] TASK                         what a task printed
+  pin                                    where this host serves output, and its key's pin
+  version
+
+Most commands take --json.
+`)
 	os.Exit(2)
 }
 
 func enroll(args []string) error {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	server := fs.String("server", "", "control plane URL")
+	poolName := fs.String("pool", "", "the pool to put this host in, when enrolling signed in")
 	host, _ := os.Hostname()
 	name := fs.String("name", strings.TrimSuffix(host, ".local"), "host name shown in the control plane")
-	_ = fs.Parse(args)
-	if *server == "" || fs.NArg() != 1 {
-		return fmt.Errorf("usage: mcc enroll --server URL [--name NAME] TOKEN")
+	rest := parse(fs, args)
+	if len(rest) > 1 || (len(rest) == 1 && *server == "") {
+		return fmt.Errorf("usage: mcc enroll [--pool POOL] [--name NAME] (signed in), or mcc enroll --server URL [--name NAME] TOKEN")
 	}
 	dir, err := config.Dir()
 	if err != nil {
@@ -93,12 +139,39 @@ func enroll(args []string) error {
 	if _, err := config.LoadState(dir); err == nil {
 		return fmt.Errorf("this host is already enrolled (state in %s)", dir)
 	}
+	// With no token in hand, whoever is signed in asks for one: it is used at once, here.
+	var token string
+	if len(rest) == 1 {
+		token = rest[0]
+	} else {
+		c, err := api.New()
+		if err != nil {
+			return fmt.Errorf("%w, or give a token: mcc enroll --server URL TOKEN", err)
+		}
+		if *server != "" && strings.TrimSuffix(*server, "/") != strings.TrimSuffix(c.Server, "/") {
+			return fmt.Errorf("signed in to %s, not %s", c.Server, *server)
+		}
+		*server = c.Server
+		req := map[string]string{"host_name": *name}
+		if *poolName != "" {
+			req["pool_id"] = *poolName
+		}
+		var out struct {
+			Token string `json:"token"`
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := c.Do(ctx, http.MethodPost, "/api/v1/enrollment-tokens", req, &out); err != nil {
+			return fmt.Errorf("asking for an enrollment token: %w", err)
+		}
+		token = out.Token
+	}
 	id, err := identity.Generate(dir)
 	if err != nil {
 		return err
 	}
 	body, _ := json.Marshal(map[string]string{
-		"token":      fs.Arg(0),
+		"token":      token,
 		"name":       *name,
 		"public_key": id.PublicKey(),
 		"os":         runtime.GOOS,
@@ -123,7 +196,10 @@ func enroll(args []string) error {
 	if err := config.SaveState(dir, config.State{ServerURL: *server, HostID: out.HostID, TenantID: out.TenantID}); err != nil {
 		return err
 	}
-	fmt.Printf("Enrolled as host %s. Start the agent with `mcc run` (or enable its service).\n", out.HostID)
+	fmt.Printf("Enrolled as host %s. Start the agent with `mcc run` (or start its service), then `mcc check`.\n", out.HostID)
+	if *poolName == "" && len(rest) == 0 {
+		fmt.Printf("It is in no pool yet: mcc pool add-host POOL %s\n", *name)
+	}
 	return nil
 }
 
@@ -145,6 +221,15 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// One agent per state directory. `mcc check` reads the same lock to say whether one runs.
+	lock, ok, err := lockAgent(dir)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("an agent is already running with the state in %s", dir)
+	}
+	defer lock.Close()
 	if s := os.Getenv("MCC_SERVER_URL"); s != "" {
 		state.ServerURL = s
 	}
