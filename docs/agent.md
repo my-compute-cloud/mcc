@@ -586,7 +586,10 @@ shared networking unless `require_network_isolation` is set.
 
 1. The image's base VM (`mcc-base-<hash>`, with a suffix when the host adds Xcode or container
    images to it) is cloned once per image; each job clones it to
-   `mcc-<assignment id>` (copy-on-write on APFS).
+   `mcc-<assignment id>` (copy-on-write on APFS). The agent writes down each job VM it makes,
+   in `tart/jobs` in its state directory, and stops or deletes only those. Your own VMs are
+   left alone whatever they are called, and after a crash it cleans up by that record, not by
+   name.
 2. The clone boots headless; the agent waits for the Tart guest agent (`tart exec`). Images must
    include the guest agent, which our images (`ghcr.io/my-compute-cloud/macos-runner`) and all
    non-vanilla Cirrus Labs images do. No SSH is used. A job's `PATH` and environment are the

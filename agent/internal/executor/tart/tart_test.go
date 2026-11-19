@@ -156,14 +156,72 @@ func TestRefreshReplacesBase(t *testing.T) {
 	}
 }
 
-func TestListIgnoresBasesAndOthers(t *testing.T) {
-	tt, _ := stubTart(t)
+// The owner's own VMs live beside the agent's and may be named anything, including like a
+// job's. The agent cleans up what it made, by its own record, and nothing else.
+func TestOnlyVMsTheAgentMadeAreItsToDelete(t *testing.T) {
+	tt, logf := stubTart(t)
+	tt.Dir = t.TempDir()
 	ctx := context.Background()
-	_, _ = tt.run(ctx, "clone", "x", "mcc-base-abc")
-	_, _ = tt.run(ctx, "clone", "x", "someone-elses-vm")
-	_, _ = tt.run(ctx, "clone", "x", "mcc-job1")
-	l, _ := tt.List(ctx)
-	if len(l) != 1 || l[0].AssignmentID != "job1" {
+	image := protocol.ImageSpec{Name: "sequoia", Source: "ghcr.io/x/y"}
+	if err := tt.Prepare(ctx, image); err != nil {
+		t.Fatal(err)
+	}
+	theirs := []string{"mcc-image-tahoe", "mcc-kvm-host", "mcc-job1", "someone-elses-vm"}
+	for _, name := range theirs {
+		_, _ = tt.run(ctx, "clone", "x", name)
+	}
+	if l, _ := tt.List(ctx); len(l) != 0 {
+		t.Fatalf("VMs the agent did not make were listed as its leftovers: %+v", l)
+	}
+	// Even asked directly, it does not touch one.
+	if err := tt.Stop(ctx, executor.Handle{AssignmentID: "kvm-host", Name: "mcc-kvm-host"}); err != nil {
+		t.Fatal(err)
+	}
+	// And it will not take one over by starting a job of the same name.
+	if _, err := tt.Start(ctx, "job1", image, executor.StartOptions{}); err == nil {
+		t.Fatal("started a job over a VM that was already there")
+	}
+
+	h, err := tt.Start(ctx, "job2", image, executor.StartOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A new agent, after a crash, finds the one it made, from the record on disk.
+	again, _ := stubTart(t)
+	again.Bin, again.Dir = tt.Bin, tt.Dir
+	l, _ := again.List(ctx)
+	if len(l) != 1 || l[0] != h {
+		t.Fatalf("leftovers: %+v", l)
+	}
+	if err := again.Stop(ctx, l[0]); err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := again.List(ctx); len(l) != 0 {
+		t.Fatalf("still listed after cleanup: %+v", l)
+	}
+	for _, c := range calls(t, logf) {
+		for _, name := range theirs {
+			if c == "delete "+name || strings.HasPrefix(c, "stop "+name) {
+				t.Fatalf("the agent ran %q on a VM it did not make", c)
+			}
+		}
+	}
+	for _, name := range theirs {
+		if !again.exists(ctx, name) {
+			t.Fatalf("%s is gone", name)
+		}
+	}
+}
+
+// A VM the agent made and someone else deleted is forgotten, not chased.
+func TestARecordWithoutItsVMIsDropped(t *testing.T) {
+	tt, _ := stubTart(t)
+	tt.Dir = t.TempDir()
+	ctx := context.Background()
+	if err := tt.record("mcc-gone"); err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := tt.List(ctx); len(l) != 0 || tt.isRecorded("mcc-gone") {
 		t.Fatalf("%+v", l)
 	}
 }

@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -41,6 +42,11 @@ const (
 type Tart struct {
 	Bin string
 	Log *slog.Logger
+	// Dir is where the agent writes down which VMs it made. Tart's VMs are the whole account's,
+	// not the agent's: the owner's own VMs sit beside the agent's, and may be named anything.
+	// So a VM is the agent's to stop and delete only if it is written down here, never because
+	// of its name. Empty keeps the record in memory, which forgets when the agent stops.
+	Dir string
 	// BootTimeout bounds waiting for the guest agent after boot.
 	BootTimeout time.Duration
 	// Xcode is the host's Xcode.app to copy into every macOS base, or "" for none.
@@ -50,6 +56,7 @@ type Tart struct {
 
 	mu      sync.Mutex
 	running map[string]*exec.Cmd // VM name -> `tart run` process
+	made    map[string]bool      // job VMs this agent made, when there is no Dir to keep them in
 	prepMu  sync.Mutex           // serialises image pulls
 	built   map[string]string    // base name -> the image digest it was built from
 	xcode   xcodeInfo            // the host Xcode's version, read at most once a minute
@@ -60,7 +67,7 @@ func New(log *slog.Logger) *Tart {
 	if err != nil {
 		bin = "tart"
 	}
-	return &Tart{Bin: bin, Log: log, BootTimeout: 5 * time.Minute, running: map[string]*exec.Cmd{}, built: map[string]string{}}
+	return &Tart{Bin: bin, Log: log, BootTimeout: 5 * time.Minute, running: map[string]*exec.Cmd{}, made: map[string]bool{}, built: map[string]string{}}
 }
 
 // BaseName is the local VM an image is cloned to before jobs clone from it, when nothing is
@@ -92,6 +99,67 @@ func (t *Tart) base(ctx context.Context, image protocol.ImageSpec) (string, erro
 // VMName is the job VM for an assignment.
 func VMName(assignmentID string) string {
 	return jobPrefix + assignmentID
+}
+
+// jobName keeps a name from being anything but one file name of ours.
+var jobName = regexp.MustCompile(`^mcc-[A-Za-z0-9][A-Za-z0-9_-]{0,99}$`)
+
+func (t *Tart) recordPath(name string) string { return filepath.Join(t.Dir, "jobs", name) }
+
+// record writes down that a job VM is about to be made, before it is.
+func (t *Tart) record(name string) error {
+	if !jobName.MatchString(name) {
+		return fmt.Errorf("%q cannot name a job's VM", name)
+	}
+	if t.Dir == "" {
+		t.mu.Lock()
+		t.made[name] = true
+		t.mu.Unlock()
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(t.recordPath(name)), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(t.recordPath(name), nil, 0o600)
+}
+
+func (t *Tart) forget(name string) {
+	if t.Dir == "" {
+		t.mu.Lock()
+		delete(t.made, name)
+		t.mu.Unlock()
+		return
+	}
+	_ = os.Remove(t.recordPath(name))
+}
+
+// recorded lists the job VMs this agent has written down as its own.
+func (t *Tart) recorded() []string {
+	var out []string
+	if t.Dir == "" {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		for name := range t.made {
+			out = append(out, name)
+		}
+		return out
+	}
+	entries, _ := os.ReadDir(filepath.Join(t.Dir, "jobs"))
+	for _, e := range entries {
+		if !e.IsDir() && jobName.MatchString(e.Name()) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func (t *Tart) isRecorded(name string) bool {
+	for _, n := range t.recorded() {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Tart) run(ctx context.Context, args ...string) (string, error) {
@@ -318,7 +386,16 @@ func (t *Tart) Start(ctx context.Context, assignmentID string, image protocol.Im
 	if !t.exists(ctx, base) {
 		return h, fmt.Errorf("image %s is not prepared", image.Name)
 	}
+	// A VM of this name that is already there is not ours: we have not made it yet. Writing it
+	// down would make it ours to delete.
+	if t.exists(ctx, h.Name) && !t.isRecorded(h.Name) {
+		return h, fmt.Errorf("a VM named %s already exists and was not made by this agent", h.Name)
+	}
+	if err := t.record(h.Name); err != nil {
+		return h, err
+	}
 	if _, err := t.run(ctx, "clone", base, h.Name); err != nil {
+		t.forget(h.Name)
 		return h, err
 	}
 	set := []string{"set", h.Name}
@@ -416,25 +493,41 @@ func (t *Tart) Exec(ctx context.Context, h executor.Handle, c executor.Command) 
 	return 0, nil
 }
 
+// Stop halts and deletes a job's VM. It touches only a VM this agent wrote down as its own:
+// asked about any other, it does nothing, whatever the VM is called.
 func (t *Tart) Stop(ctx context.Context, h executor.Handle) error {
-	t.halt(ctx, h.Name, 15)
-	if !t.exists(ctx, h.Name) {
+	if !t.isRecorded(h.Name) {
 		return nil
 	}
-	_, err := t.run(ctx, "delete", h.Name)
-	return err
+	t.halt(ctx, h.Name, 15)
+	if t.exists(ctx, h.Name) {
+		if _, err := t.run(ctx, "delete", h.Name); err != nil {
+			return err
+		}
+	}
+	t.forget(h.Name)
+	return nil
 }
 
+// List returns the job VMs this agent made that are still there, for cleaning up after a
+// crash. It goes by the agent's own record, not by what VMs are called: the owner of the
+// machine may have VMs of their own under any name, including ones that look like ours.
 func (t *Tart) List(ctx context.Context) ([]executor.Handle, error) {
 	vms, err := t.list(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var out []executor.Handle
+	there := map[string]bool{}
 	for _, v := range vms {
-		if strings.HasPrefix(v.Name, jobPrefix) && !strings.HasPrefix(v.Name, basePrefix) {
-			out = append(out, executor.Handle{AssignmentID: strings.TrimPrefix(v.Name, jobPrefix), Name: v.Name})
+		there[v.Name] = true
+	}
+	var out []executor.Handle
+	for _, name := range t.recorded() {
+		if !there[name] {
+			t.forget(name) // it was deleted without us
+			continue
 		}
+		out = append(out, executor.Handle{AssignmentID: strings.TrimPrefix(name, jobPrefix), Name: name})
 	}
 	return out, nil
 }

@@ -492,6 +492,7 @@ func newExecutor(dir string, policy config.Policy, log *slog.Logger) (executor.E
 		return f, nil
 	case "tart":
 		t := tart.New(log)
+		t.Dir = filepath.Join(dir, "tart")
 		t.Xcode = policy.Xcode
 		t.Preload = policy.PreloadImages
 		return t, nil
