@@ -247,10 +247,12 @@ type poolHostView struct {
 }
 
 type poolView struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Label     string `json:"label"`
-	Isolation string `json:"isolation"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	// Also lists what a workflow may add to runs-on to choose among the pool's hosts.
+	Also      []string `json:"also"`
+	Isolation string   `json:"isolation"`
 	Image     *struct {
 		Name   string `json:"name"`
 		Source string `json:"source"`
@@ -377,7 +379,7 @@ func printPools(pools []poolView) {
 		fmt.Println("No pools. Create one: mcc pool create NAME --label LABEL --image IMAGE")
 		return
 	}
-	table("POOL\tRUNS-ON\tRUNS\tHOSTS\tQUEUED\tRUNNING\tSTATE", func(w io.Writer) {
+	table("POOL\tRUNS-ON\tMAY ADD\tRUNS\tHOSTS\tQUEUED\tRUNNING\tSTATE", func(w io.Writer) {
 		for _, p := range pools {
 			ready := 0
 			for _, h := range p.Hosts {
@@ -391,7 +393,7 @@ func printPools(pools []poolView) {
 			} else if ready == 0 {
 				state = "no host ready"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d of %d ready\t%d\t%d\t%s\n", p.Name, p.Label, p.runs(), ready, len(p.Hosts), p.Queued, p.Running, state)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d of %d ready\t%d\t%d\t%s\n", p.Name, p.Label, or(strings.Join(p.Also, ", "), "-"), p.runs(), ready, len(p.Hosts), p.Queued, p.Running, state)
 		}
 	})
 }
