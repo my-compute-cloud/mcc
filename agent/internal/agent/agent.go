@@ -274,6 +274,9 @@ func (a *Agent) session(ctx context.Context) error {
 		Platform:     protocol.Platform{OS: runtime.GOOS, Arch: runtime.GOARCH},
 		Signature:    a.o.Identity.SignHello(ch.Nonce, a.o.HostID),
 		Assignments:  a.reports(),
+		// The policy is read when the agent starts and a change to it restarts the agent, so
+		// what each connection opens with is the policy in force.
+		Policy: policyReport(a.o.Policy),
 	}
 	if err := write(sctx, conn, &hello); err != nil {
 		return err

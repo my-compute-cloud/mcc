@@ -60,6 +60,31 @@
       },
       "required": ["name", "label"]
     },
+    "HostPolicy": {
+      "type": "object",
+      "description": "The policy a host is running under, as its owner set it: what the host accepts and how it runs it. The host enforces it whatever the control plane does; the control plane is told so that it does not send what would be refused, and so that the account can see it. Paths on the host and the commands of its tasks are not part of it.",
+      "properties": {
+        "max_vms": { "type": "integer" },
+        "allowed_images": { "type": "array", "items": { "type": "string" }, "description": "Patterns of image sources the host runs. Empty means any image of the account" },
+        "excluded_images": { "type": "array", "items": { "type": "string" }, "description": "Patterns of image sources the host never runs" },
+        "allowed_github_urls": { "type": "array", "items": { "type": "string" }, "description": "Repositories or organizations runners may register with. Empty means any" },
+        "allowed_workloads": { "type": "array", "items": { "type": "string" }, "description": "The kinds of work the host takes: github-runner, script" },
+        "active_hours": { "type": "string", "description": "Local time window such as 22:00-07:00. Empty means always" },
+        "cpus": { "type": "integer", "description": "Per VM; 0 means a share of the host's" },
+        "memory_mb": { "type": "integer", "description": "Per VM; 0 means a share of the host's" },
+        "disk_gb": { "type": "integer", "description": "Per VM; 0 means the image's own size" },
+        "isolate_network": { "type": "boolean" },
+        "require_network_isolation": { "type": "boolean" },
+        "shared_runner": { "type": "boolean" },
+        "image_refresh_hours": { "type": "integer" },
+        "cache": { "type": "string", "description": "Who shares a job cache: runner, host, or empty when jobs have none" },
+        "cache_max_gb": { "type": "integer" },
+        "share_nix_store": { "type": "boolean" },
+        "host_tasks": { "type": "boolean", "description": "Whether work may run on the host itself" },
+        "upgrade_wait_minutes": { "type": "integer", "description": "How long running work may hold back a newer agent; 0 means as long as it takes" }
+      },
+      "required": ["max_vms"]
+    },
     "TaskParam": {
       "type": "object",
       "description": "One parameter of a task. A list of these rather than an object, so that the generated types stay simple.",
@@ -108,7 +133,8 @@
         "versions": { "type": "array", "items": { "type": "integer" }, "description": "Protocol versions the agent speaks" },
         "platform": { "$ref": "#/$defs/Platform" },
         "signature": { "type": "string", "description": "base64 Ed25519 signature over \"mcc-hello\\n\" + nonce + \"\\n\" + host_id" },
-        "assignments": { "type": "array", "items": { "$ref": "#/$defs/AssignmentReport" } }
+        "assignments": { "type": "array", "items": { "$ref": "#/$defs/AssignmentReport" } },
+        "policy": { "$ref": "#/$defs/HostPolicy", "description": "The policy the agent is running under. It reads its policy when it starts, so this is current for as long as the connection lasts. Absent from agents that do not report it" }
       },
       "required": ["host_id", "agent_version", "versions", "platform", "signature", "assignments"]
     },

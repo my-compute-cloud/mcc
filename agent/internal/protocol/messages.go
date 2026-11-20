@@ -77,6 +77,39 @@ type PoolConfig struct {
 	Isolation Isolation `json:"isolation,omitempty"`
 }
 
+// HostPolicy: The policy a host is running under, as its owner set it: what the host accepts and how it runs it. The host enforces it whatever the control plane does; the control plane is told so that it does not send what would be refused, and so that the account can see it. Paths on the host and the commands of its tasks are not part of it.
+type HostPolicy struct {
+	MaxVms int `json:"max_vms"`
+	// Patterns of image sources the host runs. Empty means any image of the account
+	AllowedImages []string `json:"allowed_images,omitempty"`
+	// Patterns of image sources the host never runs
+	ExcludedImages []string `json:"excluded_images,omitempty"`
+	// Repositories or organizations runners may register with. Empty means any
+	AllowedGithubUrls []string `json:"allowed_github_urls,omitempty"`
+	// The kinds of work the host takes: github-runner, script
+	AllowedWorkloads []string `json:"allowed_workloads,omitempty"`
+	// Local time window such as 22:00-07:00. Empty means always
+	ActiveHours string `json:"active_hours,omitempty"`
+	// Per VM; 0 means a share of the host's
+	Cpus int `json:"cpus,omitempty"`
+	// Per VM; 0 means a share of the host's
+	MemoryMb int `json:"memory_mb,omitempty"`
+	// Per VM; 0 means the image's own size
+	DiskGb                  int  `json:"disk_gb,omitempty"`
+	IsolateNetwork          bool `json:"isolate_network,omitempty"`
+	RequireNetworkIsolation bool `json:"require_network_isolation,omitempty"`
+	SharedRunner            bool `json:"shared_runner,omitempty"`
+	ImageRefreshHours       int  `json:"image_refresh_hours,omitempty"`
+	// Who shares a job cache: runner, host, or empty when jobs have none
+	Cache         string `json:"cache,omitempty"`
+	CacheMaxGb    int    `json:"cache_max_gb,omitempty"`
+	ShareNixStore bool   `json:"share_nix_store,omitempty"`
+	// Whether work may run on the host itself
+	HostTasks bool `json:"host_tasks,omitempty"`
+	// How long running work may hold back a newer agent; 0 means as long as it takes
+	UpgradeWaitMinutes int `json:"upgrade_wait_minutes,omitempty"`
+}
+
 // TaskParam: One parameter of a task. A list of these rather than an object, so that the generated types stay simple.
 type TaskParam struct {
 	Key   string `json:"key"`
@@ -130,6 +163,8 @@ type Hello struct {
 	// base64 Ed25519 signature over "mcc-hello\n" + nonce + "\n" + host_id
 	Signature   string             `json:"signature"`
 	Assignments []AssignmentReport `json:"assignments"`
+	// The policy the agent is running under. It reads its policy when it starts, so this is current for as long as the connection lasts. Absent from agents that do not report it
+	Policy HostPolicy `json:"policy,omitempty"`
 }
 
 type Capacity struct {

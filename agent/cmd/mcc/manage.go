@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/my-compute-cloud/mcc/agent/internal/api"
+	"github.com/my-compute-cloud/mcc/agent/internal/protocol"
 )
 
 // The commands that manage an account: images, pools, hosts, tasks, webhooks and tokens. Each
@@ -420,6 +421,33 @@ type hostView struct {
 	ImagesReady []string   `json:"images_ready"`
 	Tasks       []string   `json:"tasks"`
 	Scripts     bool       `json:"scripts"`
+	// Policy is what the host said it runs under when its agent last connected. Nil from an
+	// agent that does not say.
+	Policy *protocol.HostPolicy `json:"policy"`
+}
+
+// describeReportedPolicy says in words what a host told the control plane of its policy.
+func describeReportedPolicy(p protocol.HostPolicy) []string {
+	images := "any image of the account"
+	if len(p.AllowedImages) > 0 {
+		images = "matching " + strings.Join(p.AllowedImages, ", ")
+	}
+	if len(p.ExcludedImages) > 0 {
+		images += ", except " + strings.Join(p.ExcludedImages, ", ")
+	}
+	out := []string{
+		"Images        " + images,
+		"Runners for   " + or(strings.Join(p.AllowedGithubUrls, ", "), "any repository or organization"),
+		"Work          " + or(strings.Join(p.AllowedWorkloads, ", "), "github-runner") + yes(p.HostTasks, ", and tasks on the host itself", ""),
+		"Hours         " + or(p.ActiveHours, "always"),
+	}
+	cache := "none"
+	if p.Cache != "" {
+		cache = "one per " + yes(p.Cache == "host", "host", "repository or organization")
+	}
+	out = append(out, "Job cache     "+cache+yes(p.ShareNixStore, "; its Nix store is shared with jobs, read-only", ""))
+	out = append(out, "Network       "+yes(p.IsolateNetwork, "VMs reach the internet only", "VMs share the host's network")+yes(p.RequireNetworkIsolation, ", or do not run", ""))
+	return out
 }
 
 func (h hostView) state() string {
@@ -477,6 +505,14 @@ func host(args []string) error {
 			fmt.Printf("  Images ready  %s\n", or(strings.Join(h.ImagesReady, ", "), "none"))
 			fmt.Printf("  Tasks         %s\n", or(strings.Join(h.Tasks, ", "), "none declared"))
 			fmt.Printf("  Scripts       %s\n", yes(h.Scripts, "allowed in its VMs", "not allowed"))
+			if h.Policy == nil {
+				fmt.Println("  Policy        not reported; its agent is older than the report, or has never connected")
+			} else {
+				fmt.Println("  Policy, as it reported when its agent last started:")
+				for _, l := range describeReportedPolicy(*h.Policy) {
+					fmt.Println("    " + l)
+				}
+			}
 			for _, p := range st.Problems {
 				if p.Subject.Kind == "host" && p.Subject.ID == h.ID {
 					fmt.Printf("  %s: %s\n    %s\n", strings.ToUpper(p.Severity), p.Message, p.Fix)

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -167,6 +168,33 @@ func startMsg(id string) map[string]any {
 	return map[string]any{
 		"type": "start", "assignment_id": id, "image": image,
 		"workload": map[string]any{"kind": "github-runner", "runner_name": "mcc-" + id, "jit_config": "secret-jit"},
+	}
+}
+
+func TestTheAgentTellsTheControlPlaneItsPolicy(t *testing.T) {
+	policy := config.DefaultPolicy()
+	policy.AllowedImages = []string{"ghcr.io/me/*"}
+	policy.ExcludedImages = []string{"ghcr.io/me/big"}
+	policy.AllowedGitHubURLs = []string{"https://github.com/me/repo"}
+	policy.CacheDir = t.TempDir()
+	policy.Xcode = "/Applications/Xcode.app"
+	cp, _, _ := startAgent(t, policy, fake.New())
+
+	got := (<-cp.hellos).Policy
+	if got.MaxVms != 2 || !slices.Equal(got.AllowedImages, policy.AllowedImages) ||
+		!slices.Equal(got.ExcludedImages, policy.ExcludedImages) ||
+		!slices.Equal(got.AllowedGithubUrls, policy.AllowedGitHubURLs) {
+		t.Fatalf("what the host accepts: %+v", got)
+	}
+	// Defaults are reported as what they are, not as nothing.
+	if !slices.Equal(got.AllowedWorkloads, []string{"github-runner"}) || !got.IsolateNetwork ||
+		!got.SharedRunner || got.Cache != "runner" || got.UpgradeWaitMinutes != 360 {
+		t.Fatalf("defaults: %+v", got)
+	}
+	// Paths on the host stay on the host.
+	b, _ := json.Marshal(got)
+	if strings.Contains(string(b), policy.CacheDir) || strings.Contains(string(b), "Xcode") {
+		t.Fatalf("the report holds a path: %s", b)
 	}
 }
 

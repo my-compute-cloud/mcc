@@ -175,6 +175,23 @@ machine, not an MCP client. Whoever can write the policy file decides what the h
 The control plane cannot override these. A `start` that breaks the policy is answered with a
 `failed` status and the reason. `mcc policy` prints the effective policy.
 
+The agent tells the control plane what its policy is each time it connects, with every
+default filled in. It reads the policy only when it starts, so what it last said is what
+is in force. The control plane uses the report for two things and can do
+nothing else with it:
+
+- **Not sending what would be refused.** A job goes only to a host whose policy takes its
+  image, its kind of work and, for a runner, the repository or organization it registers
+  with. Work that no host of its pool takes waits, and `mcc status` says which host refuses
+  it and why (`demand_refused_by_policy`).
+- **Showing it.** `mcc host show HOST` prints what each host accepts, from any machine
+  signed in to the account.
+
+The report leaves out paths on the host (`cache_dir`, `xcode`) and the commands and
+environment of declared tasks; of those the control plane learns only that a cache exists
+and the tasks' names. The agent still checks every `start` itself: a control plane that
+ignored the report would only be refused.
+
 | Field | Default | Meaning |
 |---|---|---|
 | `max_vms` | 2 | Concurrent VMs of any kind. Of those, at most two can be macOS guests, which is Apple's rule; Linux guests are limited only by this number. |
