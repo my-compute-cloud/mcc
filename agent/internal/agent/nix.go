@@ -115,13 +115,15 @@ func (n *HostNix) Snapshot(ctx context.Context, id string) (string, func(), erro
 // the host's store, 18 from GitHub and 6 from the cache.
 //
 // What a job builds itself goes into the cache as soon as it is built, by a hook Nix runs
-// after each build, so a job that fails late still leaves its work. Only what was built is
-// written, not what it depends on: a later job gets those from wherever this one did, and
-// builds what it cannot get (fallback).
+// after each build, so a job that fails late still leaves its work.
 //
-// Sources a job fetched, such as the inputs of a flake, are not built, so no hook sees
-// them. mcc_nix_keep, which the entry command runs when the job has ended, writes those:
-// the paths named "-source" that the job added to its store.
+// Everything else a job added to its store is written when the job has ended, by
+// mcc_nix_keep, which the entry command runs then: what it fetched, such as the inputs of a
+// flake, which no build hook sees, and what it copied from the host's store or downloaded.
+// A system of 13 GiB took 126 seconds to copy from the host's store and 44 from the cache.
+// So a repository's cache comes to hold what its jobs use, a second copy of part of the
+// host's store; the agent deletes what no job has used for a while (cache.TrimNix), which
+// it can tell because a job marks each path it used that the cache already had.
 //
 // The settings are also left in MCC_NIX_CONFIG, for an image that has no Nix and a workflow
 // that installs it: adding them to /etc/nix/nix.conf after installing does the same.
@@ -147,7 +149,8 @@ mkdir -p "\$C/nar" || exit 0
 [ -e "\$C/nix-cache-info" ] || printf 'StoreDir: /nix/store\n' > "\$C/nix-cache-info"
 for p in \$OUT_PATHS; do
   b=\${p##*/}; h=\${b%%-*}
-  [ -e "\$C/\$h.narinfo" ] && continue
+  # Already kept. It is marked as used, which is how the host knows not to delete it.
+  if [ -e "\$C/\$h.narinfo" ]; then touch "\$C/\$h.narinfo"; continue; fi
   hash=\$("\$NS" -q --hash "\$p") || continue
   size=\$("\$NS" -q --size "\$p") || continue
   refs=\$("\$NS" -q --references "\$p" | sed 's#.*/##' | tr '\n' ' ')
@@ -202,15 +205,15 @@ fallback = true
     sleep 1
   done
 }
-# mcc_nix_keep writes to the job's cache the sources the job fetched, with the same hook
-# that writes what it built. It does nothing unless mcc_nix set the cache up.
+# mcc_nix_keep writes to the job's cache what the job added to its store, with the same hook
+# that writes what it built, a few paths at a time. It does nothing unless mcc_nix set the
+# cache up. Derivations are left out: Nix makes those again from the source in no time.
 mcc_nix_keep() {
   [ -n "${MCC_NIX_BEFORE:-}" ] && [ -x "${hook:-}" ] || return 0
-  local new
-  new=$(ls /nix/store 2>/dev/null | grep -e '-source$' | grep -vxFf "$MCC_NIX_BEFORE" | sed 's#^#/nix/store/#' | tr '\n' ' ')
+  ls /nix/store 2>/dev/null | grep -v -e '^\.' -e '\.drv$' -e '\.lock$' -e '\.check$' |
+    grep -vxFf "$MCC_NIX_BEFORE" | sed 's#^#/nix/store/#' |
+    xargs -n 8 -P 4 sudo -n -H sh -c 'OUT_PATHS="$*" exec "$0"' "$hook" >/dev/null 2>&1 || true
   rm -f "$MCC_NIX_BEFORE"
-  [ -n "$new" ] || return 0
-  sudo -n -H env OUT_PATHS="$new" "$hook" >/dev/null 2>&1 || true
 }
 mcc_nix || true
 `

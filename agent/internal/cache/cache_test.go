@@ -87,3 +87,61 @@ func TestPruneDeletesLeastRecentlyUsedAndSparesBusy(t *testing.T) {
 		t.Error("deleting a cache followed a link out of it")
 	}
 }
+
+func TestNixPathsNoJobHasUsedLatelyAreDeleted(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	m := New(t.TempDir(), "runner", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.Now = func() time.Time { return now }
+	dir, release, _ := m.Acquire("https://github.com/acme/app")
+	nar := filepath.Join(dir, "nix", "nar")
+	if err := os.MkdirAll(nar, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	put := func(hash string, used time.Time) {
+		t.Helper()
+		info := filepath.Join(dir, "nix", hash+".narinfo")
+		for _, f := range []string{info, filepath.Join(nar, hash+".nar")} {
+			if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// A job marks a path as used by touching its description.
+		if err := os.Chtimes(info, used, used); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("stale", now.Add(-NixUnusedFor-time.Hour))
+	put("fresh", now.Add(-time.Hour))
+	_ = os.WriteFile(filepath.Join(dir, "nix", "nix-cache-info"), []byte("StoreDir: /nix/store\n"), 0o644)
+
+	// While a job holds the cache nothing is deleted; when the last one lets go, the stale go.
+	if _, err := os.Stat(filepath.Join(nar, "stale.nar")); err != nil {
+		t.Fatal("deleted while a job held the cache")
+	}
+	release()
+	for _, f := range []string{"stale.narinfo", "nar/stale.nar"} {
+		if _, err := os.Stat(filepath.Join(dir, "nix", f)); !os.IsNotExist(err) {
+			t.Errorf("%s was kept", f)
+		}
+	}
+	for _, f := range []string{"fresh.narinfo", "nar/fresh.nar", "nix-cache-info"} {
+		if _, err := os.Stat(filepath.Join(dir, "nix", f)); err != nil {
+			t.Errorf("%s was deleted", f)
+		}
+	}
+
+	// A job may have replaced the directory with a link out of the cache: nothing is deleted
+	// through it.
+	outside := t.TempDir()
+	old := now.Add(-NixUnusedFor - time.Hour)
+	_ = os.WriteFile(filepath.Join(outside, "victim.narinfo"), []byte("x"), 0o644)
+	_ = os.Chtimes(filepath.Join(outside, "victim.narinfo"), old, old)
+	linked := t.TempDir()
+	_ = os.Symlink(outside, filepath.Join(linked, "nix"))
+	if n, _ := TrimNix(linked, now); n != 0 {
+		t.Error("deleted through a link")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "victim.narinfo")); err != nil {
+		t.Error("a file outside the cache was deleted")
+	}
+}

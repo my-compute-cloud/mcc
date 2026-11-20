@@ -406,12 +406,20 @@ A job that builds with Nix starts in a new VM with an empty store of its own, an
 or build everything again. Two things spare it that. Both apply to images that have Nix, such
 as ours, and need nothing in the workflow.
 
-**The job's cache keeps what jobs build and fetch.** With `cache_dir` set, Nix in the VM
-writes each thing it builds into `nix/` in the job's cache as soon as it is built, and takes
-from there what an earlier job of the same repository built. A job that fails late still
-leaves what it finished. When a job ends, the sources it fetched, such as the inputs of a
-flake, are written there too; a job whose VM is stopped before it ends leaves none. What a
-build depends on is otherwise not kept: a later job gets that where this one did. Who shares a cache is who shares these builds, and nothing in it is signed, so
+**The job's cache keeps what jobs use.** With `cache_dir` set, Nix in the VM writes each
+thing it builds into `nix/` in the job's cache as soon as it is built, and takes from there
+what an earlier job of the same repository had. A job that fails late still leaves what it
+finished. When a job ends, everything else it added to its store is written there too: the
+sources it fetched, and what it copied from the host's store or downloaded. A job whose VM
+is stopped before it ends leaves only what it built.
+
+- The cache holds a second copy of what a repository's jobs take from the host's store:
+  about 13 GB for a job that builds a whole system. A path no job has used for 14 days is
+  deleted; `cache_max_gb` still bounds all caches together.
+- Writing it takes time after the job has ended, during which its VM still holds a slot:
+  about two minutes for those 13 GB the first time, seconds once the cache has them.
+
+Who shares a cache is who shares these builds, and nothing in it is signed, so
 the warning under [Job caches](#job-caches) holds here with more weight: a job can leave a
 build for a later one to run.
 
@@ -430,11 +438,10 @@ never uses the host's in place, and cannot change it.
 
 Nix tries the cache first, then the host's store, then the caches the image or the workflow
 configured. The cache comes first because a path in it is one file, while the host's store
-is read file by file through the share. That is slow for a path of many small files: the
-source of nixpkgs took 44 seconds from the host's store, 18 from GitHub and 6 from the
-cache. So the first job of a repository after its nixpkgs changes pays for the source once,
-and later jobs do not. The agent sets this up in the VM's `/etc/nix/nix.conf` and restarts the Nix daemon
-before the runner starts.
+is read file by file through the share. Copying a system of 13 GiB into a new VM took 94
+seconds from the host's store and 25 from the cache; the source of nixpkgs, some ninety
+thousand small files, took 44 seconds and 6. So the host's store serves the first job that
+needs a path, and the cache every job after it.
 
 An image without Nix, where a workflow installs it, gets the same from `MCC_NIX_CONFIG`: the
 entry command leaves the settings there, and a step can add them after installing:

@@ -102,10 +102,17 @@ func (m *Manager) Acquire(githubURL string) (string, func(), error) {
 	release := func() {
 		once.Do(func() {
 			m.mu.Lock()
+			idle := false
 			if m.inUse[unit]--; m.inUse[unit] <= 0 {
 				delete(m.inUse, unit)
+				idle = true
 			}
 			m.mu.Unlock()
+			if idle {
+				if n, freed := TrimNix(dir, m.Now().Add(-NixUnusedFor)); n > 0 {
+					m.Log.Info("deleted Nix paths no job has used lately", "cache", unit, "paths", n, "freed_mb", freed>>20)
+				}
+			}
 		})
 	}
 	return dir, release, nil
@@ -141,6 +148,53 @@ func size(dir string) int64 {
 		return nil
 	})
 	return n
+}
+
+// NixUnusedFor is how long a Nix path stays in a cache after the last job that used it.
+const NixUnusedFor = 14 * 24 * time.Hour
+
+// TrimNix deletes from a cache's Nix store paths (dir/nix, a binary cache the jobs write)
+// those no job has used since cutoff, and says how many and how many bytes. A job marks
+// what it used by touching the path's .narinfo, so that file's time is when it was last
+// used. Deleting one only costs a later job a copy from wherever it came from first.
+//
+// Without this the cache would only grow: each version of each package a repository's jobs
+// ever used would stay until the whole cache was deleted.
+func TrimNix(dir string, cutoff time.Time) (paths int, freed int64) {
+	nix := filepath.Join(dir, "nix")
+	// A job writes this directory, and could have made it, or nar inside it, a link to
+	// somewhere else on the host. Nothing is deleted through a link.
+	for _, d := range []string{nix, filepath.Join(nix, "nar")} {
+		if st, err := os.Lstat(d); err != nil || !st.IsDir() {
+			return 0, 0
+		}
+	}
+	entries, err := os.ReadDir(nix)
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".narinfo") {
+			continue
+		}
+		info, err := e.Info()
+		// Only ordinary files: a job could have put a link here that points elsewhere.
+		if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		nar := filepath.Join(nix, "nar", strings.TrimSuffix(name, ".narinfo")+".nar")
+		if st, err := os.Lstat(nar); err == nil && st.Mode().IsRegular() {
+			freed += st.Size()
+			_ = os.Remove(nar)
+		}
+		// The description last, so that a path is never described without its archive for
+		// longer than it takes to delete one file.
+		if os.Remove(filepath.Join(nix, name)) == nil {
+			paths++
+		}
+	}
+	return paths, freed
 }
 
 // Prune deletes whole units, least recently used first, until the cache is within MaxBytes.
