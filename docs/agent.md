@@ -122,6 +122,18 @@ update that changes the agent or its policy is picked up this way and never rest
 Elsewhere the agent watches its own file, which the install script replaces. A rollback is
 picked up like an upgrade.
 
+To see which agent is running, compare the two:
+
+```bash
+mcc version
+```
+
+is the installed one, and the `Agent ...` line of `mcc check` is the one that is running.
+A build from source carries the commit it was made from, such as `0.1.0+e2c4478`, so two
+builds of the same number can be told apart; a release carries its number alone. When the
+two differ, the running agent has not switched yet, and `mcc check` says what it is waiting
+for. `mcc host show HOST` shows the same from any machine signed in to the account.
+
 Stopping the service is different, and still immediate: `launchctl bootout`, `systemctl stop`
 and a shutdown stop what is running. To empty a host first:
 

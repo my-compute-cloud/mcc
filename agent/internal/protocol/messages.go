@@ -95,7 +95,8 @@ type HostPolicy struct {
 	// Per VM; 0 means a share of the host's
 	MemoryMb int `json:"memory_mb,omitempty"`
 	// Per VM; 0 means the image's own size
-	DiskGb                  int  `json:"disk_gb,omitempty"`
+	DiskGb int `json:"disk_gb,omitempty"`
+	// Whether VMs reach the internet only. False when the policy asks for that but the host cannot do it
 	IsolateNetwork          bool `json:"isolate_network,omitempty"`
 	RequireNetworkIsolation bool `json:"require_network_isolation,omitempty"`
 	SharedRunner            bool `json:"shared_runner,omitempty"`

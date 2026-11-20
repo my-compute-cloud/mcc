@@ -73,7 +73,7 @@
         "cpus": { "type": "integer", "description": "Per VM; 0 means a share of the host's" },
         "memory_mb": { "type": "integer", "description": "Per VM; 0 means a share of the host's" },
         "disk_gb": { "type": "integer", "description": "Per VM; 0 means the image's own size" },
-        "isolate_network": { "type": "boolean" },
+        "isolate_network": { "type": "boolean", "description": "Whether VMs reach the internet only. False when the policy asks for that but the host cannot do it" },
         "require_network_isolation": { "type": "boolean" },
         "shared_runner": { "type": "boolean" },
         "image_refresh_hours": { "type": "integer" },

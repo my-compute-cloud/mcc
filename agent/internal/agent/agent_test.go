@@ -191,6 +191,11 @@ func TestTheAgentTellsTheControlPlaneItsPolicy(t *testing.T) {
 		!got.SharedRunner || got.Cache != "runner" || got.UpgradeWaitMinutes != 360 {
 		t.Fatalf("defaults: %+v", got)
 	}
+	// What the host does, not what its file asks for: one that cannot confine a VM's network
+	// does not say that it does.
+	if policyReport(policy, false).IsolateNetwork {
+		t.Fatal("isolation is reported although the host cannot do it")
+	}
 	// Paths on the host stay on the host.
 	b, _ := json.Marshal(got)
 	if strings.Contains(string(b), policy.CacheDir) || strings.Contains(string(b), "Xcode") {

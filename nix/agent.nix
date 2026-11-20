@@ -2,6 +2,9 @@
   lib,
   buildGoModule,
   version,
+  # The commit the source is at, if known. It is part of what the agent calls itself and not
+  # of the package's name, so that the Go modules are not fetched again for every commit.
+  rev ? null,
 }:
 
 buildGoModule {
@@ -13,7 +16,9 @@ buildGoModule {
   ldflags = [
     "-s"
     "-w"
-    "-X github.com/my-compute-cloud/mcc/agent/internal/agent.Version=${version}"
+    "-X github.com/my-compute-cloud/mcc/agent/internal/agent.Version=${version}${
+      lib.optionalString (rev != null) "+${rev}"
+    }"
   ];
   # The agent tests talk to an in-process WebSocket server on the loopback interface.
   __darwinAllowLocalNetworking = true;

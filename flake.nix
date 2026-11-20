@@ -23,6 +23,9 @@
           builtins.fromJSON (builtins.readFile ./release.json)
         else
           null;
+      # A build from source names the commit of this repository it was made from, so that it
+      # is not mistaken for the release of the same number: 0.1.0+e2c4478.
+      rev = self.shortRev or self.dirtyShortRev or null;
       sourceVersion = if release != null then release.version else "0.0.0-dev";
     in
     {
@@ -33,7 +36,10 @@
           asset = if release != null then release.assets.${system} or null else null;
 
           # Built from the source in this repository.
-          agent-source = pkgs.callPackage ./nix/agent.nix { version = sourceVersion; };
+          agent-source = pkgs.callPackage ./nix/agent.nix {
+            version = sourceVersion;
+            inherit rev;
+          };
 
           # The binary from the GitHub release, where one exists for this system. The Mac one is
           # signed and notarized; the Linux ones are static.

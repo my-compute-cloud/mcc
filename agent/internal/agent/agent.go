@@ -31,7 +31,8 @@ import (
 	"github.com/my-compute-cloud/mcc/agent/internal/tasklog"
 )
 
-// Version is set at build time with -ldflags.
+// Version is set at build time with -ldflags: a release's number, or for a build from
+// source the number and the commit, such as 0.1.0+e2c4478.
 var Version = "dev"
 
 // CacheSource hands out the host directory a job may keep downloads in. The directory depends
@@ -276,7 +277,7 @@ func (a *Agent) session(ctx context.Context) error {
 		Assignments:  a.reports(),
 		// The policy is read when the agent starts and a change to it restarts the agent, so
 		// what each connection opens with is the policy in force.
-		Policy: policyReport(a.o.Policy),
+		Policy: policyReport(a.o.Policy, a.isolationOK),
 	}
 	if err := write(sctx, conn, &hello); err != nil {
 		return err

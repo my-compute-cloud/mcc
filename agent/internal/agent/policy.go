@@ -17,7 +17,7 @@ import (
 // Left out on purpose: paths on the host (the cache directory, Xcode) and the commands and
 // environment of declared tasks, which may hold what the owner would not want to leave the
 // machine. The names of the tasks travel with the host's capacity.
-func policyReport(p config.Policy) protocol.HostPolicy {
+func policyReport(p config.Policy, isolationOK bool) protocol.HostPolicy {
 	workloads := slices.Clone(p.AllowedWorkloads)
 	if len(workloads) == 0 {
 		workloads = []string{workloadGitHubRunner}
@@ -30,16 +30,18 @@ func policyReport(p config.Policy) protocol.HostPolicy {
 		}
 	}
 	return protocol.HostPolicy{
-		MaxVms:                  p.MaxVMs,
-		AllowedImages:           slices.Clone(p.AllowedImages),
-		ExcludedImages:          slices.Clone(p.ExcludedImages),
-		AllowedGithubUrls:       slices.Clone(p.AllowedGitHubURLs),
-		AllowedWorkloads:        workloads,
-		ActiveHours:             p.ActiveHours,
-		Cpus:                    p.CPUs,
-		MemoryMb:                p.MemoryMB,
-		DiskGb:                  p.DiskGB,
-		IsolateNetwork:          p.NetworkIsolation(),
+		MaxVms:            p.MaxVMs,
+		AllowedImages:     slices.Clone(p.AllowedImages),
+		ExcludedImages:    slices.Clone(p.ExcludedImages),
+		AllowedGithubUrls: slices.Clone(p.AllowedGitHubURLs),
+		AllowedWorkloads:  workloads,
+		ActiveHours:       p.ActiveHours,
+		Cpus:              p.CPUs,
+		MemoryMb:          p.MemoryMB,
+		DiskGb:            p.DiskGB,
+		// What the host does, not what the file asks for: without Softnet a VM shares the
+		// host's network whatever the policy says.
+		IsolateNetwork:          p.NetworkIsolation() && isolationOK,
 		RequireNetworkIsolation: p.RequireNetworkIsolation,
 		SharedRunner:            p.SharedRunnerEnabled(),
 		ImageRefreshHours:       p.ImageRefreshHours,
