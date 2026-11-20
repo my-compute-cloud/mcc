@@ -137,13 +137,19 @@ func startAgent(t *testing.T, policy config.Policy, f *fake.Fake) (*controlPlane
 }
 
 func startAgentWith(t *testing.T, policy config.Policy, f *fake.Fake, cacheSource CacheSource) (*controlPlane, context.CancelFunc, chan struct{}) {
+	return startAgentOpts(t, policy, f, func(o *Options) { o.Cache = cacheSource })
+}
+
+func startAgentOpts(t *testing.T, policy config.Policy, f *fake.Fake, set func(*Options)) (*controlPlane, context.CancelFunc, chan struct{}) {
 	id := identity.FromSeed(make([]byte, 32))
 	cp := newControlPlane(t, id)
-	a := New(Options{
-		ServerURL: cp.srv.URL, HostID: "host-1", Identity: id, Policy: policy, Executor: f, Cache: cacheSource,
+	o := Options{
+		ServerURL: cp.srv.URL, HostID: "host-1", Identity: id, Policy: policy, Executor: f,
 		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MinBackoff: 20 * time.Millisecond, MaxBackoff: 50 * time.Millisecond,
-	})
+	}
+	set(&o)
+	a := New(o)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

@@ -357,6 +357,14 @@ func run(args []string) error {
 		jobCache = c
 	}
 
+	var hostNix *agent.HostNix
+	if policy.ShareNixStore {
+		if hostNix, err = agent.NewHostNix(filepath.Join(dir, "nix")); err != nil {
+			log.Warn("share_nix_store is set but the store cannot be shared; jobs run without it", "err", err)
+			hostNix = nil
+		}
+	}
+
 	a := agent.New(agent.Options{
 		ServerURL:     state.ServerURL,
 		HostID:        state.HostID,
@@ -366,6 +374,7 @@ func run(args []string) error {
 		HostExecutor:  hostEx,
 		Runner:        runnerSource(runners),
 		Cache:         jobCache,
+		HostNix:       hostNix,
 		TaskOutput:    taskOutput,
 		OutputAddress: outputAddress,
 		OutputPin:     outputPin,

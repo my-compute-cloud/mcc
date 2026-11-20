@@ -123,6 +123,10 @@ type Policy struct {
 	// CacheMaxGB is the size above which the least recently used caches are deleted. Zero
 	// means no limit.
 	CacheMaxGB int `json:"cache_max_gb"`
+	// ShareNixStore shares this host's Nix store with each job's VM, read-only, so that
+	// Nix in the VM copies what the host already has instead of building or downloading it.
+	// Every job on the host can then read everything in the store.
+	ShareNixStore bool `json:"share_nix_store"`
 	// HostTasks lets work run on this host itself, without a virtual machine. Off unless the
 	// owner turns it on: such work is not isolated from the host.
 	HostTasks HostTasks `json:"host_tasks"`

@@ -365,6 +365,16 @@ func describePolicy(p config.Policy) []string {
 			out = append(out, "Declared tasks: "+strings.Join(names, ", ")+".")
 		}
 	}
+	if p.CacheDir != "" {
+		who := "each repository or organization its own"
+		if p.CacheScope == "host" {
+			who = "one for every job on this host"
+		}
+		out = append(out, "Jobs keep downloads and Nix builds in "+p.CacheDir+", "+who+".")
+	}
+	if p.ShareNixStore {
+		out = append(out, "Every job can read this host's Nix store, and none can change it.")
+	}
 	if p.ActiveHours != "" {
 		out = append(out, "Only during "+p.ActiveHours+".")
 	}

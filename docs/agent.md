@@ -193,6 +193,7 @@ The control plane cannot override these. A `start` that breaks the policy is ans
 | `cache_dir` | none | Host directory where jobs keep downloads between runs; see below |
 | `cache_scope` | `runner` | Who shares a cache: `runner` or `host` |
 | `cache_max_gb` | no limit | Above this, the least recently used caches are deleted |
+| `share_nix_store` | `false` | Share this host's Nix store with each job's VM, read-only; see [Nix](#nix) |
 | `host_tasks` | off | Lets work run on the host itself, without a VM; see [below](#jobs-on-the-host-itself) |
 | `tasks` | none | Commands the control plane may ask this host to run, by name; see [below](#tasks) |
 | `allowed_workloads` | `["github-runner"]` | The kinds of work this host takes. Add `"script"` to let callers run their own shell scripts in its VMs; see [below](#scripts-in-vms) |
@@ -368,6 +369,48 @@ from a fork. Leave `cache_dir` unset on hosts that run code from people you do n
 Caches are plain directories under `cache_dir/data`; deleting one only costs the next job its
 downloads. With `cache_max_gb`, the agent deletes whole caches, least recently used first, when
 the total passes the limit, and never one a running job is using.
+
+## Nix
+
+A job that builds with Nix starts in a new VM with an empty store of its own, and would fetch
+or build everything again. Two things spare it that. Both apply to images that have Nix, such
+as ours, and need nothing in the workflow.
+
+**The job's cache keeps what jobs build.** With `cache_dir` set, Nix in the VM writes each
+thing it builds into `nix/` in the job's cache as soon as it is built, and takes from there
+what an earlier job of the same repository built. A job that fails late still leaves what it
+finished. Only what was built is kept, not what it was built from: a later job gets that where
+this one did. Who shares a cache is who shares these builds, and nothing in it is signed, so
+the warning under [Job caches](#job-caches) holds here with more weight: a job can leave a
+build for a later one to run.
+
+**The host's own store, read-only.** With `"share_nix_store": true`, each VM is given the
+host's `/nix/store` as a share it cannot write to, and Nix in the VM copies from it what the
+host already has instead of downloading or building it. A host that has built its own system
+gives a job building the same system nearly all of it. The job still has its own store; it
+never uses the host's in place, and cannot change it.
+
+- Every job on the host can read everything in the host's store. Do not turn it on where the
+  store holds what a job should not see.
+- The agent needs `sqlite3` on the host (macOS has it) to give each job a consistent copy of
+  the store's database, made when the job starts.
+- It relies on Nix's `read-only-local-store` feature, which Nix calls experimental. If the
+  Nix in an image refuses it, the job runs as if the setting were off.
+
+Nix tries the host's store first, then the cache, then the caches the image or the workflow
+configured. The agent sets this up in the VM's `/etc/nix/nix.conf` and restarts the Nix daemon
+before the runner starts.
+
+An image without Nix, where a workflow installs it, gets the same from `MCC_NIX_CONFIG`: the
+entry command leaves the settings there, and a step can add them after installing:
+
+```yaml
+- run: |
+    if [ -n "${MCC_NIX_CONFIG:-}" ]; then
+      printf '%s\n' "$MCC_NIX_CONFIG" | sudo tee -a /etc/nix/nix.conf
+      sudo launchctl kickstart -k system/org.nixos.nix-daemon
+    fi
+```
 
 ## Jobs on the host itself
 

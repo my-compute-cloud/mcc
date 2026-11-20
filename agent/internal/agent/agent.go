@@ -58,6 +58,9 @@ type Options struct {
 	Runner       RunnerSource
 	// Cache is nil when the owner has not set a cache directory.
 	Cache CacheSource
+	// HostNix is the host's Nix store, shared read-only with jobs. Nil unless the owner
+	// turned that on and the host has one.
+	HostNix *HostNix
 	// TaskOutput keeps what tasks print. Nil keeps nothing.
 	TaskOutput *tasklog.Store
 	// OutputAddress and OutputPin are where callers on other machines read a task's output

@@ -57,7 +57,9 @@ if [ -d "/Volumes/My Shared Files/` + cacheShare + `" ]; then
   ln -sfn "/Volumes/My Shared Files/` + cacheShare + `" "$HOME/.mcc-cache"
   export MCC_CACHE_DIR="$HOME/.mcc-cache"
 fi
-if [ -r /etc/mcc/job-env ]; then
+SHARES="/Volumes/My Shared Files"
+SHARES_URL="/Volumes/My%20Shared%20Files"
+` + nixSetup + `if [ -r /etc/mcc/job-env ]; then
   . /etc/mcc/job-env
 fi
 cd "$RUNNER"
@@ -78,7 +80,8 @@ if [ -d "$SHARES/` + cacheShare + `" ]; then
   ln -sfn "$SHARES/` + cacheShare + `" "$HOME/.mcc-cache"
   export MCC_CACHE_DIR="$HOME/.mcc-cache"
 fi
-if [ -r /etc/mcc/job-env ]; then
+SHARES_URL="$SHARES"
+` + nixSetup + `if [ -r /etc/mcc/job-env ]; then
   . /etc/mcc/job-env
 fi
 cd "$RUNNER"
@@ -618,6 +621,16 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 				release()
 				go a.o.Cache.Prune()
 			}()
+		}
+	}
+	if runner && a.o.HostNix != nil {
+		// A job that cannot have the host's store runs without it, as on any other host.
+		if dir, remove, err := a.o.HostNix.Snapshot(ctx, m.AssignmentID); err != nil {
+			lg.Warn("running without the host's Nix store", "err", err)
+		} else {
+			opts.SharedDirs[nixStoreShare] = executor.SharedDir{Path: a.o.HostNix.Store()}
+			opts.SharedDirs[nixStateShare] = executor.SharedDir{Path: dir}
+			defer remove()
 		}
 	}
 	started := time.Now()
