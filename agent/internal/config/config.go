@@ -84,8 +84,11 @@ type Policy struct {
 	// MaxVMs caps concurrent VMs. Apple's licence allows two macOS VMs per host.
 	MaxVMs int `json:"max_vms"`
 	// AllowedImages are glob patterns (path.Match syntax, plus a trailing *) matched against
-	// image sources. Empty means any image the control plane's pool configuration names.
+	// image sources. Empty means any image of the account.
 	AllowedImages []string `json:"allowed_images"`
+	// ExcludedImages are patterns of the same kind for images this host does not run, even
+	// ones AllowedImages matches.
+	ExcludedImages []string `json:"excluded_images"`
 	// AllowedGitHubURLs restricts which repositories or organizations runners may register
 	// with, for example "https://github.com/your-org". Empty allows any.
 	AllowedGitHubURLs []string `json:"allowed_github_urls"`
@@ -416,6 +419,11 @@ func (p Policy) Validate() error {
 			return fmt.Errorf("policy: allowed_images %q: %w", g, err)
 		}
 	}
+	for _, g := range p.ExcludedImages {
+		if _, err := path.Match(g, ""); err != nil {
+			return fmt.Errorf("policy: excluded_images %q: %w", g, err)
+		}
+	}
 	if p.DiskGB < 0 || p.CacheMaxGB < 0 {
 		return fmt.Errorf("policy: disk_gb and cache_max_gb must not be negative")
 	}
@@ -487,12 +495,19 @@ func (h HostTasks) validate(p Policy) error {
 // It starts with a letter or digit, so a reference can never be read as an option.
 var containerImage = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
 
-// ImageAllowed reports whether policy permits an image source.
+// ImageAllowed reports whether policy permits an image source: no excluded pattern matches
+// it, and an allowed one does, or there are none.
 func (p Policy) ImageAllowed(source string) bool {
-	if len(p.AllowedImages) == 0 {
-		return true
+	if matchesImage(p.ExcludedImages, source) {
+		return false
 	}
-	for _, g := range p.AllowedImages {
+	return len(p.AllowedImages) == 0 || matchesImage(p.AllowedImages, source)
+}
+
+// matchesImage reports whether any of the patterns matches an image source. A trailing *
+// matches the rest of the source, slashes included, which path.Match's * does not.
+func matchesImage(globs []string, source string) bool {
+	for _, g := range globs {
 		if strings.HasSuffix(g, "*") && strings.HasPrefix(source, strings.TrimSuffix(g, "*")) {
 			return true
 		}

@@ -48,6 +48,33 @@ func TestImageAllowed(t *testing.T) {
 	}
 }
 
+func TestAnExcludedImageIsRefusedWhateverIsAllowed(t *testing.T) {
+	p := Policy{
+		AllowedImages:  []string{"ghcr.io/me/*"},
+		ExcludedImages: []string{"ghcr.io/me/macos-runner:*", "ghcr.io/me/big"},
+	}
+	for src, want := range map[string]bool{
+		"ghcr.io/me/ubuntu-runner:latest": true,
+		"ghcr.io/me/macos-runner:tahoe":   false,
+		"ghcr.io/me/big":                  false,
+		"ghcr.io/other/ubuntu:latest":     false,
+	} {
+		if p.ImageAllowed(src) != want {
+			t.Errorf("%s: want %v", src, want)
+		}
+	}
+	// With nothing allowed by name, everything is, except what is excluded.
+	only := Policy{ExcludedImages: []string{"ghcr.io/me/big"}}
+	if !only.ImageAllowed("ghcr.io/other/ubuntu:latest") || only.ImageAllowed("ghcr.io/me/big") {
+		t.Error("an exclusion alone refuses only what it matches")
+	}
+	bad := DefaultPolicy()
+	bad.ExcludedImages = []string{"["}
+	if bad.Validate() == nil {
+		t.Error("a malformed pattern is refused")
+	}
+}
+
 func TestGitHubURLAllowed(t *testing.T) {
 	p := Policy{AllowedGitHubURLs: []string{"https://github.com/Acme/Builds/"}}
 	if !p.GitHubURLAllowed("https://github.com/acme/builds") || p.GitHubURLAllowed("https://github.com/other/nix") {

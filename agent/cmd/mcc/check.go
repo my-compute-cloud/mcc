@@ -285,8 +285,8 @@ func inspect(ctx context.Context, dir string) *report {
 		case p.Isolation == "host":
 			r.ok("pool", "Pool %s (runs-on: %s): work runs on this host itself.", p.Name, p.Label)
 		case p.Image != nil && perr == nil && !policy.ImageAllowed(sourceOf[p.Image.Name]):
-			r.bad("policy_refuses_image", fmt.Sprintf("Pool %s uses image %s (%s), which this host's allowed_images refuses.", p.Name, p.Image.Name, sourceOf[p.Image.Name]),
-				"Add a pattern for it to allowed_images in "+config.PolicyPath(dir)+", or use another image.")
+			r.bad("policy_refuses_image", fmt.Sprintf("Pool %s uses image %s (%s), which this host's policy refuses.", p.Name, p.Image.Name, sourceOf[p.Image.Name]),
+				"Change allowed_images or excluded_images in "+config.PolicyPath(dir)+", or use another image.")
 		case p.Image != nil && !contains(me.ImagesReady, p.Image.Name):
 			r.warn("image_not_ready", fmt.Sprintf("Pool %s: image %s is not ready on this host yet. The first download of a macOS image takes a long time.", p.Name, p.Image.Name),
 				"Watch the agent's log; `tart list` shows what has arrived.")
@@ -328,11 +328,14 @@ func contains(list []string, v string) bool {
 func describePolicy(p config.Policy) []string {
 	var out []string
 	out = append(out, fmt.Sprintf("Up to %d VMs at once.", p.MaxVMs))
-	if len(p.AllowedImages) == 0 {
-		out = append(out, "Any image.")
-	} else {
-		out = append(out, "Images matching: "+strings.Join(p.AllowedImages, ", ")+".")
+	images := "Any image of the account"
+	if len(p.AllowedImages) > 0 {
+		images = "Images matching: " + strings.Join(p.AllowedImages, ", ")
 	}
+	if len(p.ExcludedImages) > 0 {
+		images += ", except: " + strings.Join(p.ExcludedImages, ", ")
+	}
+	out = append(out, images+".")
 	switch {
 	case !p.WorkloadAllowed("github-runner"):
 		out = append(out, "No GitHub Actions jobs.")

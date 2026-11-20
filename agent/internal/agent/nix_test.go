@@ -110,3 +110,35 @@ func TestEntryScriptsParse(t *testing.T) {
 		}
 	}
 }
+
+// An image no pool of this host is set to is one a job may name: it is not fetched ahead of
+// time, and is fetched and run when a job asks for it.
+func TestAnImageAJobNamesIsFetchedWhenAsked(t *testing.T) {
+	f := fake.New()
+	cp, _, _ := startAgent(t, config.DefaultPolicy(), f)
+	<-cp.hellos
+	cp.next(isType("capacity"))
+
+	tahoe := protocol.ImageSpec{Name: "tahoe", Source: "ghcr.io/acme/tahoe:1", Platform: "darwin"}
+	cp.send(map[string]any{
+		"type":   "config",
+		"pools":  []protocol.PoolConfig{{Name: "mac", Label: "mcc-macos", Image: image.Name}},
+		"images": []protocol.ImageSpec{image, tahoe},
+	})
+	// A start is handled after the config before it, so by the time this one has run the
+	// agent has prepared what it was going to.
+	cp.send(startMsg("p1"))
+	cp.next(status("p1", "finished"))
+	ctx := context.Background()
+	if !f.Ready(ctx, image) || f.Ready(ctx, tahoe) {
+		t.Fatalf("ahead of time: pool's image ready %v, the other %v", f.Ready(ctx, image), f.Ready(ctx, tahoe))
+	}
+
+	m := startMsg("p2")
+	m["image"] = tahoe
+	cp.send(m)
+	cp.next(status("p2", "finished"))
+	if !f.Ready(ctx, tahoe) {
+		t.Fatal("the named image was not fetched for the job that asked")
+	}
+}

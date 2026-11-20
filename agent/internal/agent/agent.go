@@ -107,6 +107,7 @@ type Agent struct {
 	mu          sync.Mutex
 	assignments map[string]*assignment
 	images      map[string]protocol.ImageSpec // by name, as configured by the control plane
+	pooled      map[string]bool               // image name -> a pool of this host is set to it
 	ready       map[string]bool               // image name -> prepared
 	preparing   map[string]bool
 	refreshing  int             // images being refreshed now
@@ -639,27 +640,34 @@ func (a *Agent) sendCapacity() {
 	})
 }
 
-// applyConfig records the images the control plane wants and prepares those policy allows.
+// applyConfig records the images the control plane may ask for, and prepares those a pool of
+// this host is set to and policy allows. The others are the account's other images, which a
+// job may name in place of its pool's; one of those is fetched when a job first asks for it.
 func (a *Agent) applyConfig(ctx context.Context, pools []protocol.PoolConfig, images []protocol.ImageSpec) {
 	a.mu.Lock()
 	a.images = map[string]protocol.ImageSpec{}
 	for _, img := range images {
 		a.images[img.Name] = img
 	}
+	a.pooled = map[string]bool{}
+	for _, p := range pools {
+		if p.Image != "" {
+			a.pooled[p.Image] = true
+		}
+	}
 	for name := range a.ready {
 		if _, ok := a.images[name]; !ok {
 			delete(a.ready, name)
 		}
 	}
+	pooled := a.pooled
 	a.mu.Unlock()
 	for _, img := range images {
-		if !a.o.Policy.ImageAllowed(img.Source) {
+		if pooled[img.Name] && !a.o.Policy.ImageAllowed(img.Source) {
 			a.log.Warn("image not allowed by local policy; not preparing it", "image", img.Name, "source", img.Source)
-			continue
 		}
 	}
 	a.prepareMissing(ctx)
-	_ = pools
 }
 
 // prepareMissing starts fetching each image the control plane wants, the owner allows and the
@@ -669,7 +677,9 @@ func (a *Agent) prepareMissing(ctx context.Context) {
 	a.mu.Lock()
 	images := make([]protocol.ImageSpec, 0, len(a.images))
 	for _, img := range a.images {
-		images = append(images, img)
+		if a.pooled[img.Name] {
+			images = append(images, img)
+		}
 	}
 	a.mu.Unlock()
 	for _, img := range images {

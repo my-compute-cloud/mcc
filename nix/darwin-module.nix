@@ -81,7 +81,8 @@ in
       default = { };
       example = {
         max_vms = 2;
-        allowed_images = [ "ghcr.io/cirruslabs/*" ];
+        allowed_images = [ "ghcr.io/my-compute-cloud/*" ];
+        excluded_images = [ "ghcr.io/my-compute-cloud/macos-runner:sequoia" ];
         allowed_github_urls = [ "https://github.com/your-org" ];
         active_hours = "22:00-07:00";
       };
