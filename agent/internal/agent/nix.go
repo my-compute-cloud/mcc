@@ -105,21 +105,31 @@ func (n *HostNix) Snapshot(ctx context.Context, id string) (string, func(), erro
 // guest has the host's shares in, and SHARES_URL the same as it is written in a URL.
 //
 // Both are sources Nix takes paths from instead of building or downloading them, tried
-// before the public cache: the host's store first, since nothing is unpacked from it.
-// Neither is signed. The host's store is the owner's; the cache holds what earlier jobs of
-// the same repository built, which is who the owner said shares a cache.
+// before the public cache. Neither is signed. The host's store is the owner's; the cache
+// holds what earlier jobs of the same repository built or fetched, which is who the owner
+// said shares a cache.
+//
+// The cache is tried first. A path in it is one file, read in one go, while a path in the
+// host's store is read file by file through the share, which is slow for a path of many
+// small files: the source of nixpkgs, some ninety thousand of them, took 44 seconds from
+// the host's store, 18 from GitHub and 6 from the cache.
 //
 // What a job builds itself goes into the cache as soon as it is built, by a hook Nix runs
 // after each build, so a job that fails late still leaves its work. Only what was built is
 // written, not what it depends on: a later job gets those from wherever this one did, and
 // builds what it cannot get (fallback).
 //
+// Sources a job fetched, such as the inputs of a flake, are not built, so no hook sees
+// them. mcc_nix_keep, which the entry command runs when the job has ended, writes those:
+// the paths named "-source" that the job added to its store.
+//
 // The settings are also left in MCC_NIX_CONFIG, for an image that has no Nix and a workflow
 // that installs it: adding them to /etc/nix/nix.conf after installing does the same.
 const nixSetup = `mcc_nix() {
-  local conf="" hook=/etc/nix/mcc-built subs=""
+  local conf="" subs=""
+  hook=/etc/nix/mcc-built
   if [ -r "$SHARES/` + nixStateShare + `/db/db.sqlite" ] && [ -d "$SHARES/` + nixStoreShare + `" ]; then
-    subs="local?store=/nix/store&real=$SHARES_URL/` + nixStoreShare + `&state=$SHARES_URL/` + nixStateShare + `&read-only=true&trusted=true&priority=5"
+    subs="local?store=/nix/store&real=$SHARES_URL/` + nixStoreShare + `&state=$SHARES_URL/` + nixStateShare + `&read-only=true&trusted=true&priority=10"
     conf="extra-experimental-features = read-only-local-store
 "
   fi
@@ -154,7 +164,10 @@ done
 exit 0
 HOOK
     sudo chmod 755 "$hook"
-    subs="${subs:+$subs }file://$MCC_CACHE_DIR/nix?trusted=true&priority=10"
+    subs="file://$MCC_CACHE_DIR/nix?trusted=true&priority=5${subs:+ $subs}"
+    # What the store holds now, so that what the job adds can be told apart at its end.
+    MCC_NIX_BEFORE=$(mktemp)
+    ls /nix/store > "$MCC_NIX_BEFORE" 2>/dev/null || true
     conf="${conf}post-build-hook = $hook
 "
   fi
@@ -188,6 +201,16 @@ fallback = true
     "$ns" --gc --print-roots >/dev/null 2>&1 && break
     sleep 1
   done
+}
+# mcc_nix_keep writes to the job's cache the sources the job fetched, with the same hook
+# that writes what it built. It does nothing unless mcc_nix set the cache up.
+mcc_nix_keep() {
+  [ -n "${MCC_NIX_BEFORE:-}" ] && [ -x "${hook:-}" ] || return 0
+  local new
+  new=$(ls /nix/store 2>/dev/null | grep -e '-source$' | grep -vxFf "$MCC_NIX_BEFORE" | sed 's#^#/nix/store/#' | tr '\n' ' ')
+  rm -f "$MCC_NIX_BEFORE"
+  [ -n "$new" ] || return 0
+  sudo -n -H env OUT_PATHS="$new" "$hook" >/dev/null 2>&1 || true
 }
 mcc_nix || true
 `

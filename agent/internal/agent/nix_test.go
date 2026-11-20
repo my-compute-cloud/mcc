@@ -103,6 +103,12 @@ func TestEntryScriptsParse(t *testing.T) {
 		if !strings.Contains(script, "mcc_nix || true") {
 			t.Fatalf("%s: the Nix setup is missing", platform)
 		}
+		// The runner is not exec'd: what the job fetched is kept once it has ended, and the
+		// entry command still ends as the runner did.
+		keep, exit := strings.Index(script, "mcc_nix_keep || true"), strings.LastIndex(script, "exit $rc")
+		if run := strings.Index(script, "./run.sh --jitconfig"); run < 0 || keep < run || exit < keep || strings.Contains(script, "exec ./run.sh") {
+			t.Fatalf("%s: sources are not kept after the runner ends", platform)
+		}
 		cmd := exec.Command("bash", "-n")
 		cmd.Stdin = strings.NewReader(script)
 		if out, err := cmd.CombinedOutput(); err != nil {

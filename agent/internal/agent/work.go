@@ -63,7 +63,11 @@ SHARES_URL="/Volumes/My%20Shared%20Files"
   . /etc/mcc/job-env
 fi
 cd "$RUNNER"
-exec ./run.sh --jitconfig "$JIT"
+# Not exec: when the job has ended, what it fetched is kept for the next one.
+rc=0
+./run.sh --jitconfig "$JIT" || rc=$?
+mcc_nix_keep || true
+exit $rc
 `
 
 // githubRunnerScriptLinux is the same for Linux guests.
@@ -85,7 +89,11 @@ SHARES_URL="$SHARES"
   . /etc/mcc/job-env
 fi
 cd "$RUNNER"
-exec ./run.sh --jitconfig "$JIT"
+# Not exec: when the job has ended, what it fetched is kept for the next one.
+rc=0
+./run.sh --jitconfig "$JIT" || rc=$?
+mcc_nix_keep || true
+exit $rc
 `
 
 // hostRunnerScript is the fixed entry command for a runner on the host itself. The executor

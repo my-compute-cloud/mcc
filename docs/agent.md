@@ -394,11 +394,12 @@ A job that builds with Nix starts in a new VM with an empty store of its own, an
 or build everything again. Two things spare it that. Both apply to images that have Nix, such
 as ours, and need nothing in the workflow.
 
-**The job's cache keeps what jobs build.** With `cache_dir` set, Nix in the VM writes each
-thing it builds into `nix/` in the job's cache as soon as it is built, and takes from there
-what an earlier job of the same repository built. A job that fails late still leaves what it
-finished. Only what was built is kept, not what it was built from: a later job gets that where
-this one did. Who shares a cache is who shares these builds, and nothing in it is signed, so
+**The job's cache keeps what jobs build and fetch.** With `cache_dir` set, Nix in the VM
+writes each thing it builds into `nix/` in the job's cache as soon as it is built, and takes
+from there what an earlier job of the same repository built. A job that fails late still
+leaves what it finished. When a job ends, the sources it fetched, such as the inputs of a
+flake, are written there too; a job whose VM is stopped before it ends leaves none. What a
+build depends on is otherwise not kept: a later job gets that where this one did. Who shares a cache is who shares these builds, and nothing in it is signed, so
 the warning under [Job caches](#job-caches) holds here with more weight: a job can leave a
 build for a later one to run.
 
@@ -415,8 +416,12 @@ never uses the host's in place, and cannot change it.
 - It relies on Nix's `read-only-local-store` feature, which Nix calls experimental. If the
   Nix in an image refuses it, the job runs as if the setting were off.
 
-Nix tries the host's store first, then the cache, then the caches the image or the workflow
-configured. The agent sets this up in the VM's `/etc/nix/nix.conf` and restarts the Nix daemon
+Nix tries the cache first, then the host's store, then the caches the image or the workflow
+configured. The cache comes first because a path in it is one file, while the host's store
+is read file by file through the share. That is slow for a path of many small files: the
+source of nixpkgs took 44 seconds from the host's store, 18 from GitHub and 6 from the
+cache. So the first job of a repository after its nixpkgs changes pays for the source once,
+and later jobs do not. The agent sets this up in the VM's `/etc/nix/nix.conf` and restarts the Nix daemon
 before the runner starts.
 
 An image without Nix, where a workflow installs it, gets the same from `MCC_NIX_CONFIG`: the
