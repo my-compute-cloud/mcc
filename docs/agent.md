@@ -416,6 +416,9 @@ is stopped before it ends leaves only what it built.
 - The cache holds a second copy of what a repository's jobs take from the host's store:
   about 13 GB for a job that builds a whole system. A path no job has used for 14 days is
   deleted; `cache_max_gb` still bounds all caches together.
+- A path keeps the signatures it came with. So a path from `cache.nixos.org` is still
+  known as such in a later job that takes it from the cache, and a step that publishes
+  what a job built can tell it from what the job built itself.
 - Writing it takes time after the job has ended, during which its VM still holds a slot:
   about two minutes for those 13 GB the first time, seconds once the cache has them.
 
