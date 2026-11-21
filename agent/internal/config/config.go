@@ -93,7 +93,9 @@ type Policy struct {
 	// ones AllowedImages matches.
 	ExcludedImages []string `json:"excluded_images"`
 	// AllowedGitHubURLs restricts which repositories or organizations runners may register
-	// with, for example "https://github.com/your-org". Empty allows any.
+	// with, for example "https://github.com/your-org". An entry ending in /*, such as
+	// "https://github.com/you/*", takes every repository of that account and the account
+	// itself. Empty allows any.
 	AllowedGitHubURLs []string `json:"allowed_github_urls"`
 	// CPUs and MemoryMB per VM. Zero means half the host's.
 	CPUs     int `json:"cpus"`
@@ -427,6 +429,11 @@ func (p Policy) Validate() error {
 			return fmt.Errorf("policy: excluded_images %q: %w", g, err)
 		}
 	}
+	for _, a := range p.AllowedGitHubURLs {
+		if err := validGitHubPattern(a); err != nil {
+			return fmt.Errorf("policy: allowed_github_urls %q: %w", a, err)
+		}
+	}
 	if p.DiskGB < 0 || p.CacheMaxGB < 0 {
 		return fmt.Errorf("policy: disk_gb and cache_max_gb must not be negative")
 	}
@@ -528,11 +535,40 @@ func (p Policy) GitHubURLAllowed(u string) bool {
 	}
 	u = strings.TrimSuffix(strings.ToLower(u), "/")
 	for _, a := range p.AllowedGitHubURLs {
-		if strings.TrimSuffix(strings.ToLower(a), "/") == u {
+		a = strings.TrimSuffix(strings.ToLower(a), "/")
+		account, all := strings.CutSuffix(a, "/*")
+		if !all {
+			if a == u {
+				return true
+			}
+			continue
+		}
+		// Everything of one account: the account itself, where an organization's runners
+		// register, and each repository directly under it.
+		if repo, ok := strings.CutPrefix(u, account+"/"); u == account || (ok && repo != "" && !strings.Contains(repo, "/")) {
 			return true
 		}
 	}
 	return false
+}
+
+// validGitHubPattern refuses a * anywhere but as the whole repository name after an account,
+// so that an entry always names whose workflows it lets in.
+func validGitHubPattern(a string) error {
+	if !strings.Contains(a, "*") {
+		return nil
+	}
+	account, all := strings.CutSuffix(strings.TrimSuffix(a, "/"), "/*")
+	rest := account
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	// What is left must be host/account.
+	parts := strings.Split(rest, "/")
+	if !all || strings.Contains(account, "*") || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("a * may only stand for every repository of one account, as in https://github.com/you/*")
+	}
+	return nil
 }
 
 // Active reports whether t falls within the active hours.

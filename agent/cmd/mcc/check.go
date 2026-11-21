@@ -371,7 +371,7 @@ func inspect(ctx context.Context, dir string) *report {
 			}
 			if !allowed {
 				r.warn("policy_refuses_github", fmt.Sprintf("Jobs arrive from %s, but this host's allowed_github_urls has nothing of theirs, so it will refuse them.", g.Account),
-					"Add "+account+" (an organization) or the repositories' URLs (a personal account) to allowed_github_urls in "+policyPath+".")
+					"Add "+account+" (an organization), the repositories' URLs, or "+account+"/* for every repository of the account, to allowed_github_urls in "+policyPath+".")
 			}
 		}
 	}

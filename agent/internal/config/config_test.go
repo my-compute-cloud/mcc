@@ -80,6 +80,37 @@ func TestGitHubURLAllowed(t *testing.T) {
 	if !p.GitHubURLAllowed("https://github.com/acme/builds") || p.GitHubURLAllowed("https://github.com/other/nix") {
 		t.Error("url matching")
 	}
+	// An account's /* takes its repositories and the account itself, and nothing else.
+	p = Policy{AllowedGitHubURLs: []string{"https://github.com/Me/*"}}
+	for u, want := range map[string]bool{
+		"https://github.com/me/game":       true,
+		"https://github.com/ME/Nix/":       true,
+		"https://github.com/me":            true,
+		"https://github.com/me2/game":      false,
+		"https://github.com/other/me":      false,
+		"https://github.com/me/game/extra": false,
+		"https://github.com/me/":           true,
+	} {
+		if got := p.GitHubURLAllowed(u); got != want {
+			t.Errorf("%s allowed = %v, want %v", u, got, want)
+		}
+	}
+	for pattern, valid := range map[string]bool{
+		"https://github.com/me/*":    true,
+		"https://github.com/me/*/":   true,
+		"https://github.com/me/repo": true,
+		"https://github.com/*":       false,
+		"https://github.com/*/*":     false,
+		"https://github.com/me/re*":  false,
+		"https://github.com/m*/repo": false,
+		"*":                          false,
+	} {
+		p := DefaultPolicy()
+		p.AllowedGitHubURLs = []string{pattern}
+		if err := p.Validate(); (err == nil) != valid {
+			t.Errorf("%s valid = %v, want %v (%v)", pattern, err == nil, valid, err)
+		}
+	}
 }
 
 func TestLoadPolicyDefaultsAndFile(t *testing.T) {

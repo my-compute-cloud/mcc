@@ -84,7 +84,7 @@ type HostPolicy struct {
 	AllowedImages []string `json:"allowed_images,omitempty"`
 	// Patterns of image sources the host never runs
 	ExcludedImages []string `json:"excluded_images,omitempty"`
-	// Repositories or organizations runners may register with. Empty means any
+	// Repositories or organizations runners may register with. An entry ending in /* takes every repository of that account. Empty means any
 	AllowedGithubUrls []string `json:"allowed_github_urls,omitempty"`
 	// The kinds of work the host takes: github-runner, script
 	AllowedWorkloads []string `json:"allowed_workloads,omitempty"`

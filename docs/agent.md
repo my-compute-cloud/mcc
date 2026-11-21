@@ -281,7 +281,7 @@ ignored the report would only be refused.
 | `max_vms` | 2 | Concurrent VMs of any kind. Of those, at most two can be macOS guests, which is Apple's rule; Linux guests are limited only by this number. |
 | `allowed_images` | any image of the account | Glob patterns on image sources, for example `ghcr.io/cirruslabs/*`. A trailing `*` matches the rest of the source. |
 | `excluded_images` | none | Patterns of the same kind for images this host never runs, even ones `allowed_images` matches |
-| `allowed_github_urls` | any | Repository or organization URLs a runner may register with; read from the just-in-time config |
+| `allowed_github_urls` | any | Repository or organization URLs a runner may register with; read from the just-in-time config. An entry ending in `/*`, such as `https://github.com/you/*`, takes every repository of that account, and the account itself |
 | `cpus`, `memory_mb` | an equal share | Per VM. By default the host divided by `max_vms`, and never more than half. |
 | `active_hours` | always | Local time window such as `22:00-07:00`; outside it the host reports no capacity |
 | `stay_awake` | true | Holds `caffeinate -i` while any VM runs. Mac hosts only. |

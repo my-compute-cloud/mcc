@@ -67,7 +67,7 @@
         "max_vms": { "type": "integer" },
         "allowed_images": { "type": "array", "items": { "type": "string" }, "description": "Patterns of image sources the host runs. Empty means any image of the account" },
         "excluded_images": { "type": "array", "items": { "type": "string" }, "description": "Patterns of image sources the host never runs" },
-        "allowed_github_urls": { "type": "array", "items": { "type": "string" }, "description": "Repositories or organizations runners may register with. Empty means any" },
+        "allowed_github_urls": { "type": "array", "items": { "type": "string" }, "description": "Repositories or organizations runners may register with. An entry ending in /* takes every repository of that account. Empty means any" },
         "allowed_workloads": { "type": "array", "items": { "type": "string" }, "description": "The kinds of work the host takes: github-runner, script" },
         "active_hours": { "type": "string", "description": "Local time window such as 22:00-07:00. Empty means always" },
         "cpus": { "type": "integer", "description": "Per VM; 0 means a share of the host's" },
