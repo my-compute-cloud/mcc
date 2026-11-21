@@ -7,6 +7,9 @@
 //	policy.json   local policy, edited only by the host owner
 //	runner/       cached GitHub Actions runner, shared read-only into VMs
 //
+//	clouds/       other clouds the machine is enrolled in, each with a key, state and policy
+//	              of its own (clouds.go)
+//
 // Job caches (policy cache_dir) live wherever the owner puts them, not here.
 package config
 

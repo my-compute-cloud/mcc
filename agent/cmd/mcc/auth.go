@@ -48,8 +48,8 @@ func defaultServer() string {
 		return s
 	}
 	if dir, err := config.Dir(); err == nil {
-		if st, err := config.LoadState(dir); err == nil && st.ServerURL != "" {
-			return st.ServerURL
+		if enrolled, err := enrollments(dir); err == nil && len(enrolled) > 0 && enrolled[0].State.ServerURL != "" {
+			return enrolled[0].State.ServerURL
 		}
 	}
 	return api.DefaultServer

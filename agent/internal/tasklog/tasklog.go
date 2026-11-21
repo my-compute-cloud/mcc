@@ -29,7 +29,10 @@ import (
 // Meta is what is written down about one run.
 type Meta struct {
 	// ID is what the output is asked for by: the task's id in the control plane's API.
-	ID           string `json:"id"`
+	ID string `json:"id"`
+	// Cloud is the name, on this machine, of the cloud that asked for the task. Empty in what
+	// was kept before a machine could be in several, which is the cloud "default".
+	Cloud        string `json:"cloud,omitempty"`
 	AssignmentID string `json:"assignment_id"`
 	Task         string `json:"task"`
 	// SecretHash is the SHA-256, in hex, of a secret the task's caller chose. Whoever shows

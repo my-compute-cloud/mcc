@@ -164,11 +164,36 @@ func inspect(ctx context.Context, dir string) *report {
 		r.ok("policy", "The policy is valid (%s). %s", config.PolicyPath(dir), strings.Join(describePolicy(policy), " "))
 	}
 
-	state, serr := config.LoadState(dir)
-	if serr != nil {
+	// Each cloud the machine is enrolled in, and what the owner lets that cloud do here.
+	enrolled, serr := enrollments(dir)
+	several := len(enrolled) > 1
+	policies := map[string]config.Policy{}
+	switch {
+	case serr != nil:
+		r.bad("enrollment_unreadable", fmt.Sprintf("An enrollment cannot be read: %v.", serr), "Its state.json is damaged. Remove it and its identity.key, then enroll again.")
+	case len(enrolled) == 0:
+		serr = errors.New("not enrolled")
 		r.bad("not_enrolled", "This host is not enrolled.", "Sign in with `mcc auth login`, then `mcc enroll --pool POOL`.")
-	} else {
-		r.ok("enrolled", "Enrolled with %s as host %s.", state.ServerURL, state.HostID)
+	}
+	for _, e := range enrolled {
+		if !several && e.Name == config.DefaultCloud {
+			r.ok("enrolled", "Enrolled with %s as host %s.", e.State.ServerURL, e.State.HostID)
+		} else {
+			r.ok("enrolled", "Cloud %s: enrolled with %s as host %s.", e.Name, e.State.ServerURL, e.State.HostID)
+		}
+		if perr != nil {
+			continue
+		}
+		p, err := config.LoadCloudPolicy(dir, e.Name, policy)
+		if err != nil {
+			r.bad("cloud_policy_invalid", fmt.Sprintf("Cloud %s: its policy cannot be used: %v.", e.Name, err),
+				"Fix "+config.CloudPolicyPath(dir, e.Name)+". The agent does not start with a policy it cannot read.")
+			continue
+		}
+		policies[e.Name] = p
+		if e.Name != config.DefaultCloud {
+			r.ok("cloud_policy", "Cloud %s may (%s): %s", e.Name, config.CloudPolicyPath(dir, e.Name), strings.Join(describeCloudPolicy(p), " "))
+		}
 	}
 
 	if perr == nil {
@@ -202,6 +227,20 @@ func inspect(ctx context.Context, dir string) *report {
 				default:
 					r.ok("activity", "Agent %s: %s.", act.Version, describeWork(act))
 				}
+				// A cloud the agent has no connection to gets no work from this machine.
+				loaded := map[string]bool{}
+				for _, c := range act.Clouds {
+					loaded[c.Name] = true
+					if !c.Connected && several {
+						r.warn("cloud_not_connected", fmt.Sprintf("Cloud %s: the agent has no connection to %s.", c.Name, c.Server), "Its log says why. The other clouds are not affected.")
+					}
+				}
+				for _, e := range enrolled {
+					if len(act.Clouds) > 0 && !loaded[e.Name] {
+						r.warn("cloud_not_started", fmt.Sprintf("Cloud %s was enrolled after the agent started, which has not connected it yet.", e.Name),
+							"The agent starts again by itself once it is idle. `mcc drain --wait` says when nothing is running.")
+					}
+				}
 				if !act.Installed {
 					r.warn("local_build", fmt.Sprintf("The agent running is a build put in the service's place: %s.", act.Executable),
 						"`mcc use --installed` goes back to the installed agent. So does the next update that changes it.")
@@ -231,8 +270,16 @@ func inspect(ctx context.Context, dir string) *report {
 	if serr != nil {
 		return r
 	}
-	if strings.TrimSuffix(c.Server, "/") != strings.TrimSuffix(state.ServerURL, "/") {
-		r.warn("signed_in_elsewhere", fmt.Sprintf("Signed in to %s, but this host is enrolled with %s.", c.Server, state.ServerURL), "`mcc auth login --server "+state.ServerURL+"`.")
+	// Signing in chooses one cloud. What follows is about that one: the enrollment whose host
+	// the control plane knows.
+	var here []enrollment
+	for _, e := range enrolled {
+		if strings.TrimSuffix(c.Server, "/") == strings.TrimSuffix(e.State.ServerURL, "/") {
+			here = append(here, e)
+		}
+	}
+	if len(here) == 0 {
+		r.warn("signed_in_elsewhere", fmt.Sprintf("Signed in to %s, but this host is enrolled with %s.", c.Server, enrolled[0].State.ServerURL), "`mcc auth login --server "+enrolled[0].State.ServerURL+"`.")
 		return r
 	}
 	var st statusView
@@ -241,15 +288,34 @@ func inspect(ctx context.Context, dir string) *report {
 		return r
 	}
 	var me *hostView
-	for i := range st.Hosts {
-		if st.Hosts[i].ID == state.HostID {
-			me = &st.Hosts[i]
+	var mine enrollment
+	for _, e := range here {
+		for i := range st.Hosts {
+			if st.Hosts[i].ID == e.State.HostID {
+				me, mine = &st.Hosts[i], e
+			}
 		}
+	}
+	if me == nil && several {
+		r.warn("signed_in_to_another_cloud", "The cloud you are signed in to is none of those this machine is enrolled in, or its host there was revoked. Only this machine was looked at.",
+			"`mcc auth login` and choose one of this machine's clouds, then `mcc check` again.")
+		return r
 	}
 	if me == nil {
 		r.bad("host_unknown", "The account you are signed in to has no such host. It was revoked, or it belongs to another account.",
 			"If it was revoked: remove state.json and identity.key from "+dir+", then `mcc enroll --pool POOL` again.")
 		return r
+	}
+	state := mine.State
+	if several {
+		r.ok("signed_in_cloud", "You are signed in to the cloud this machine calls %s. What follows is what its control plane says; `mcc auth login` chooses another.", mine.Name)
+	}
+	// From here the policy is the one that governs that cloud.
+	policyPath := config.CloudPolicyPath(dir, mine.Name)
+	if p, ok := policies[mine.Name]; ok {
+		policy = p
+	} else if perr == nil {
+		perr = errors.New("the cloud's policy cannot be used")
 	}
 	if me.Connected {
 		r.ok("connected", "The control plane sees this host as %s, connected.", me.Name)
@@ -281,12 +347,12 @@ func inspect(ctx context.Context, dir string) *report {
 		switch {
 		case p.Isolation == "host" && perr == nil && !policy.HostTasks.Enabled:
 			r.bad("policy_refuses_host_work", fmt.Sprintf("Pool %s runs its work on the host itself, which this host's policy does not allow.", p.Name),
-				"Set host_tasks in "+config.PolicyPath(dir)+" if that is what you want, or `mcc pool remove-host "+p.Name+" "+me.Name+"`.")
+				"Set host_tasks in "+policyPath+" if that is what you want, or `mcc pool remove-host "+p.Name+" "+me.Name+"`.")
 		case p.Isolation == "host":
 			r.ok("pool", "Pool %s (runs-on: %s): work runs on this host itself.", p.Name, p.Label)
 		case p.Image != nil && perr == nil && !policy.ImageAllowed(sourceOf[p.Image.Name]):
 			r.bad("policy_refuses_image", fmt.Sprintf("Pool %s uses image %s (%s), which this host's policy refuses.", p.Name, p.Image.Name, sourceOf[p.Image.Name]),
-				"Change allowed_images or excluded_images in "+config.PolicyPath(dir)+", or use another image.")
+				"Change allowed_images or excluded_images in "+policyPath+", or use another image.")
 		case p.Image != nil && !contains(me.ImagesReady, p.Image.Name):
 			r.warn("image_not_ready", fmt.Sprintf("Pool %s: image %s is not ready on this host yet. The first download of a macOS image takes a long time.", p.Name, p.Image.Name),
 				"Watch the agent's log; `tart list` shows what has arrived.")
@@ -305,7 +371,7 @@ func inspect(ctx context.Context, dir string) *report {
 			}
 			if !allowed {
 				r.warn("policy_refuses_github", fmt.Sprintf("Jobs arrive from %s, but this host's allowed_github_urls has nothing of theirs, so it will refuse them.", g.Account),
-					"Add "+account+" (an organization) or the repositories' URLs (a personal account) to allowed_github_urls in "+config.PolicyPath(dir)+".")
+					"Add "+account+" (an organization) or the repositories' URLs (a personal account) to allowed_github_urls in "+policyPath+".")
 			}
 		}
 	}
@@ -398,11 +464,44 @@ func describePolicy(p config.Policy) []string {
 	return out
 }
 
+// describeCloudPolicy says in words what one cloud may ask of this host: describePolicy
+// without what is true of the machine whichever cloud asks.
+func describeCloudPolicy(p config.Policy) []string {
+	p.CacheDir, p.LogLevel, p.TaskOutput.Listen = "", "", ""
+	var out []string
+	for _, line := range describePolicy(p) {
+		if !strings.HasPrefix(line, "A newer agent waits") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
 // policyCheck is `mcc policy check [FILE]`: whether a policy is valid, and what it permits.
+// With --cloud NAME it is what that cloud is permitted; with neither, the machine's policy and
+// then each cloud's.
 func policyCheck(args []string) error {
 	dir, err := config.Dir()
 	if err != nil {
 		return err
+	}
+	if len(args) > 0 && (args[0] == "--cloud" || args[0] == "-cloud") {
+		if len(args) != 2 {
+			return errors.New("usage: mcc policy check --cloud NAME")
+		}
+		machine, err := config.LoadPolicy(dir)
+		if err != nil {
+			return err
+		}
+		p, err := config.LoadCloudPolicy(dir, args[1], machine)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s\n", config.CloudPolicyPath(dir, args[1]))
+		for _, line := range describeCloudPolicy(p) {
+			fmt.Println("  " + line)
+		}
+		return nil
 	}
 	path := config.PolicyPath(dir)
 	if len(args) == 1 {
@@ -426,6 +525,27 @@ func policyCheck(args []string) error {
 	}
 	for _, line := range describePolicy(p) {
 		fmt.Println("  " + line)
+	}
+	if len(args) == 1 {
+		return nil
+	}
+	// What each other cloud this machine is enrolled in is permitted.
+	names, err := config.Clouds(dir)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if name == config.DefaultCloud {
+			continue
+		}
+		cp, err := config.LoadCloudPolicy(dir, name, p)
+		if err != nil {
+			return fmt.Errorf("cloud %s: %w", name, err)
+		}
+		fmt.Printf("\nCloud %s (%s)\n", name, config.CloudPolicyPath(dir, name))
+		for _, line := range describeCloudPolicy(cp) {
+			fmt.Println("  " + line)
+		}
 	}
 	return nil
 }

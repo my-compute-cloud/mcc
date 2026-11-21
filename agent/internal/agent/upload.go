@@ -37,8 +37,8 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 // as long as the tenant's plan keeps it. Unlike everything else about output, this hands the
 // control plane something it can read, so it happens only when the tenant's plan asks for it
 // and this host's owner has said yes (task_output.upload).
-func (a *Agent) uploadOutput(taskID string, lg *slog.Logger) {
-	store := a.o.TaskOutput
+func (c *cloud) uploadOutput(taskID string, lg *slog.Logger) {
+	store := c.o.TaskOutput
 	buf := &limitedBuffer{max: maxUpload}
 	meta, err := store.Copy(buf, taskID, 0, false, nil, nil)
 	if err != nil {
@@ -47,14 +47,14 @@ func (a *Agent) uploadOutput(taskID string, lg *slog.Logger) {
 	}
 	body := buf.Bytes()
 	sum := sha256.Sum256(body)
-	url := strings.TrimSuffix(a.o.ServerURL, "/") + "/agent/v1/tasks/" + taskID + "/output"
+	url := strings.TrimSuffix(c.o.ServerURL, "/") + "/agent/v1/tasks/" + taskID + "/output"
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * 2 * time.Second)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		ts := strconv.FormatInt(a.o.Now().Unix(), 10)
+		ts := strconv.FormatInt(c.o.Now().Unix(), 10)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 		if err != nil {
 			cancel()
@@ -62,10 +62,10 @@ func (a *Agent) uploadOutput(taskID string, lg *slog.Logger) {
 			break
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
-		req.Header.Set("X-MCC-Host", a.o.HostID)
+		req.Header.Set("X-MCC-Host", c.o.HostID)
 		req.Header.Set("X-MCC-Timestamp", ts)
 		req.Header.Set("X-MCC-Truncated", strconv.FormatBool(meta.Truncated || buf.over))
-		req.Header.Set("X-MCC-Signature", a.o.Identity.SignUpload(ts, a.o.HostID, taskID, hex.EncodeToString(sum[:])))
+		req.Header.Set("X-MCC-Signature", c.o.Identity.SignUpload(ts, c.o.HostID, taskID, hex.EncodeToString(sum[:])))
 		res, err := http.DefaultClient.Do(req)
 		cancel()
 		if err != nil {

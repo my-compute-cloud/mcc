@@ -79,6 +79,23 @@ func (a *Agent) RequestSwitch(path string, argv []string) error {
 	}
 }
 
+// Reload asks the agent to start again, once idle, as the same agent it is now: the installed
+// one, or the build its owner put in its place. It is how a running agent comes to read what is
+// only read at the start, such as a cloud the machine was just enrolled in.
+func (a *Agent) Reload() error {
+	a.mu.Lock()
+	local := a.local
+	a.mu.Unlock()
+	if !local {
+		return a.RequestSwitch("", nil)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return a.RequestSwitch(self, os.Args)
+}
+
 // Running says which agent this is: the file it runs from, and whether that is the one the
 // service starts or a build its owner put in its place.
 func (a *Agent) Running() (executable string, installed bool) {

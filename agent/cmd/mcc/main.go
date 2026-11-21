@@ -1,6 +1,7 @@
 // Command mcc is the My Compute Cloud agent.
 //
 //	mcc enroll --server URL [--name NAME] TOKEN   register this host with the control plane
+//	mcc enroll --cloud NAME ...                   offer it to another cloud as well
 //	mcc run                                       connect and run work (normally as a service)
 //	mcc policy                                    print the effective local policy
 //	mcc logs [-f] [--offset N] TASK               print what a task printed on this host
@@ -60,7 +61,7 @@ func main() {
 		if len(os.Args) > 2 && os.Args[2] == "check" {
 			err = policyCheck(os.Args[3:])
 		} else {
-			err = showPolicy()
+			err = showPolicy(os.Args[2:])
 		}
 	case "check":
 		err = check(os.Args[2:])
@@ -114,10 +115,11 @@ You, signed in:
 
 This machine, as a host:
   enroll [--pool POOL]                   register it (signed in), or: enroll --server URL TOKEN
+  enroll --cloud NAME ...                offer it to another cloud as well, under a name of yours
   check                                  what is wrong with this host
   drain [--wait] | resume                take no new work, letting what runs finish; undo it
   use PATH [--debug] | use --installed   run another build of the agent in the service's place
-  policy [check [FILE]]                  what this host allows
+  policy [check [FILE]] [--cloud NAME]   what this host allows, or allows one cloud
   run                                    connect and run work (normally as a service)
   logs [-f] TASK                         what a task printed
   pin                                    where this host serves output, and its key's pin
@@ -134,16 +136,30 @@ func enroll(args []string) error {
 	poolName := fs.String("pool", "", "the pool to put this host in, when enrolling signed in")
 	host, _ := os.Hostname()
 	name := fs.String("name", strings.TrimSuffix(host, ".local"), "host name shown in the control plane")
+	cloud := fs.String("cloud", config.DefaultCloud, "a name of your own for the cloud this enrolls the machine in, when it is already in another")
 	rest := parse(fs, args)
 	if len(rest) > 1 || (len(rest) == 1 && *server == "") {
-		return fmt.Errorf("usage: mcc enroll [--pool POOL] [--name NAME] (signed in), or mcc enroll --server URL [--name NAME] TOKEN")
+		return fmt.Errorf("usage: mcc enroll [--cloud NAME] [--pool POOL] [--name NAME] (signed in), or mcc enroll [--cloud NAME] --server URL [--name NAME] TOKEN")
+	}
+	if err := config.CheckCloudName(*cloud); err != nil {
+		return err
 	}
 	dir, err := config.Dir()
 	if err != nil {
 		return err
 	}
+	// Each cloud has its own key and state. The first enrollment's are in the state directory
+	// itself, where they always were.
+	home, dir := dir, config.CloudDir(dir, *cloud)
 	if _, err := config.LoadState(dir); err == nil {
-		return fmt.Errorf("this host is already enrolled (state in %s)", dir)
+		if *cloud == config.DefaultCloud {
+			return fmt.Errorf("this host is already enrolled (state in %s). To offer it to another cloud as well, give that one a name of your own: mcc enroll --cloud NAME", dir)
+		}
+		return fmt.Errorf("this host is already enrolled in the cloud it calls %s (state in %s)", *cloud, dir)
+	}
+	enrolled, err := enrollments(home)
+	if err != nil {
+		return err
 	}
 	// With no token in hand, whoever is signed in asks for one: it is used at once, here.
 	var token string
@@ -158,6 +174,19 @@ func enroll(args []string) error {
 			return fmt.Errorf("signed in to %s, not %s", c.Server, *server)
 		}
 		*server = c.Server
+		// Signing in chooses a cloud, and this would enroll the machine in that one again.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var st statusView
+		if _, err := c.Do(ctx, http.MethodGet, "/api/v1/status", nil, &st); err == nil {
+			for _, e := range enrolled {
+				for _, h := range st.Hosts {
+					if h.ID == e.State.HostID {
+						return fmt.Errorf("this host is already in the cloud you are signed in to, as %s (it calls that cloud %s). To enroll it in another, `mcc auth login` and choose that cloud first", h.Name, e.Name)
+					}
+				}
+			}
+		}
 		req := map[string]string{"host_name": *name}
 		if *poolName != "" {
 			req["pool_id"] = *poolName
@@ -165,8 +194,6 @@ func enroll(args []string) error {
 		var out struct {
 			Token string `json:"token"`
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
 		if _, err := c.Do(ctx, http.MethodPost, "/api/v1/enrollment-tokens", req, &out); err != nil {
 			return fmt.Errorf("asking for an enrollment token: %w", err)
 		}
@@ -202,11 +229,54 @@ func enroll(args []string) error {
 	if err := config.SaveState(dir, config.State{ServerURL: *server, HostID: out.HostID, TenantID: out.TenantID}); err != nil {
 		return err
 	}
-	fmt.Printf("Enrolled as host %s. Start the agent with `mcc run` (or start its service), then `mcc check`.\n", out.HostID)
+	for _, e := range enrolled {
+		if e.State.TenantID == out.TenantID && strings.TrimSuffix(e.State.ServerURL, "/") == strings.TrimSuffix(*server, "/") {
+			fmt.Fprintf(os.Stderr, "mcc: this machine was already in that cloud (it calls it %s), and is now in it twice. Remove one: delete %s, and the host %s in the control plane.\n", e.Name, dir, out.HostID)
+		}
+	}
+	// The agent reads its enrollments when it starts. One that is running starts again by
+	// itself once it has nothing in hand.
+	next := "Start the agent with `mcc run` (or start its service), then `mcc check`."
+	if agentRunning(home) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := tellAgent(ctx, home, http.MethodPost, "/v1/reload", nil); err != nil {
+			next = "Restart the agent's service to connect it, then `mcc check`."
+		} else {
+			next = "The running agent connects it once it is idle; `mcc check` says when it has."
+		}
+	}
+	fmt.Printf("Enrolled as host %s. %s\n", out.HostID, next)
+	if *cloud != config.DefaultCloud {
+		fmt.Printf("This cloud may run GitHub Actions jobs in VMs here and nothing else, until %s says more. `mcc policy check --cloud %s` says what it allows.\n", config.CloudPolicyPath(home, *cloud), *cloud)
+	}
 	if *poolName == "" && len(rest) == 0 {
 		fmt.Printf("It is in no pool yet: mcc pool add-host POOL %s\n", *name)
 	}
 	return nil
+}
+
+// enrollment is one cloud this machine is enrolled in, as its files say.
+type enrollment struct {
+	Name  string
+	State config.State
+}
+
+// enrollments reads the state of every cloud this machine is enrolled in.
+func enrollments(dir string) ([]enrollment, error) {
+	names, err := config.Clouds(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []enrollment
+	for _, name := range names {
+		st, err := config.LoadState(config.CloudDir(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("cloud %s: %w", name, err)
+		}
+		out = append(out, enrollment{Name: name, State: st})
+	}
+	return out, nil
 }
 
 func run(args []string) error {
@@ -225,8 +295,12 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	state, err := config.LoadState(dir)
+	enrolled, err := enrollments(dir)
 	if err != nil {
+		return err
+	}
+	if len(enrolled) == 0 {
+		_, err := config.LoadState(dir)
 		return err
 	}
 	// One agent per state directory. `mcc check` reads the same lock to say whether one runs.
@@ -238,19 +312,46 @@ func run(args []string) error {
 		return fmt.Errorf("an agent is already running with the state in %s", dir)
 	}
 	defer lock.Close()
-	if s := os.Getenv("MCC_SERVER_URL"); s != "" {
-		state.ServerURL = s
-	}
-	id, err := identity.Load(dir)
-	if err != nil {
-		return err
-	}
 	policy, err := config.LoadPolicy(dir)
 	if err != nil {
 		return err
 	}
 	if policy.LogLevel == "debug" {
 		level.Set(slog.LevelDebug)
+	}
+	// Each cloud the machine is enrolled in: its key, and the owner's say on what it may do
+	// here. The agent starts with all of them or not at all, so that a policy that cannot be
+	// read is noticed.
+	var clouds []agent.Cloud
+	var keepsOutput, hostRunner, sharesNix bool
+	for _, e := range enrolled {
+		if s := os.Getenv("MCC_SERVER_URL"); s != "" {
+			e.State.ServerURL = s
+		}
+		id, err := identity.Load(config.CloudDir(dir, e.Name))
+		if err != nil {
+			return fmt.Errorf("cloud %s: %w", e.Name, err)
+		}
+		p, err := config.LoadCloudPolicy(dir, e.Name, policy)
+		if err != nil {
+			return fmt.Errorf("cloud %s: %w", e.Name, err)
+		}
+		c := agent.Cloud{Name: e.Name, ServerURL: e.State.ServerURL, HostID: e.State.HostID, Identity: id, Policy: p}
+		if policy.CacheDir != "" {
+			// No cloud's jobs find what another's left: each has a cache of its own, whatever
+			// cache_scope says. Each may grow to cache_max_gb.
+			root := policy.CacheDir
+			if e.Name != config.DefaultCloud {
+				root = filepath.Join(root, "clouds", e.Name)
+			}
+			jc := cache.New(root, policy.CacheScope, policy.CacheMaxGB, log)
+			go jc.Prune()
+			c.Cache = jc
+		}
+		keepsOutput = keepsOutput || len(p.Tasks) > 0 || p.WorkloadAllowed("script")
+		hostRunner = hostRunner || (p.HostTasks.Enabled && p.HostTasks.GitHubRunner)
+		sharesNix = sharesNix || p.ShareNixStore
+		clouds = append(clouds, c)
 	}
 	log.Debug("debug logging is on: everything is logged, including each line a runner prints before it takes a job")
 
@@ -288,7 +389,7 @@ func run(args []string) error {
 	// What tasks print is kept here, on the host, and read from here: `mcc logs`, or anything
 	// that speaks HTTP to the socket. The socket is the agent's own account's alone.
 	var taskOutput *tasklog.Store
-	if len(policy.Tasks) > 0 || policy.WorkloadAllowed("script") {
+	if keepsOutput {
 		o := policy.TaskOutput
 		taskOutput = tasklog.New(filepath.Join(dir, "task-output"), tasklog.Limits{
 			PerTask: int64(o.MaxMB) << 20,
@@ -332,7 +433,7 @@ func run(args []string) error {
 	if policy.SharedRunnerEnabled() {
 		platforms = ex.GuestPlatforms()
 	}
-	if policy.HostTasks.Enabled && policy.HostTasks.GitHubRunner && !slices.Contains(platforms, runtime.GOOS) {
+	if hostRunner && !slices.Contains(platforms, runtime.GOOS) {
 		platforms = append(platforms, runtime.GOOS)
 	}
 	if len(platforms) > 0 && os.Getenv("MCC_EXECUTOR") != "fake" {
@@ -350,15 +451,8 @@ func run(args []string) error {
 		}
 	}
 
-	var jobCache agent.CacheSource
-	if policy.CacheDir != "" {
-		c := cache.New(policy.CacheDir, policy.CacheScope, policy.CacheMaxGB, log)
-		go c.Prune()
-		jobCache = c
-	}
-
 	var hostNix *agent.HostNix
-	if policy.ShareNixStore {
+	if sharesNix {
 		if hostNix, err = agent.NewHostNix(filepath.Join(dir, "nix")); err != nil {
 			log.Warn("share_nix_store is set but the store cannot be shared; jobs run without it", "err", err)
 			hostNix = nil
@@ -366,14 +460,11 @@ func run(args []string) error {
 	}
 
 	a := agent.New(agent.Options{
-		ServerURL:     state.ServerURL,
-		HostID:        state.HostID,
-		Identity:      id,
+		Clouds:        clouds,
 		Policy:        policy,
 		Executor:      ex,
 		HostExecutor:  hostEx,
 		Runner:        runnerSource(runners),
-		Cache:         jobCache,
 		HostNix:       hostNix,
 		TaskOutput:    taskOutput,
 		OutputAddress: outputAddress,
@@ -391,7 +482,9 @@ func run(args []string) error {
 	// A newer agent installed where this one was started from takes over once this one is idle,
 	// and so does one its owner points it at with `mcc use`.
 	go a.WatchUpgrade(ctx, upgradeFrom(policy))
-	log.Info("starting agent", "version", agent.Version, "host", state.HostID, "server", state.ServerURL)
+	for _, c := range clouds {
+		log.Info("starting agent", "version", agent.Version, "cloud", c.Name, "host", c.HostID, "server", c.ServerURL)
+	}
 	return a.Run(ctx)
 }
 
@@ -633,12 +726,21 @@ func hostMemoryMB() int {
 	return int(b / (1024 * 1024))
 }
 
-func showPolicy() error {
+// showPolicy is `mcc policy [--cloud NAME]`: the policy in effect, for the machine or as it
+// governs one cloud.
+func showPolicy(args []string) error {
+	fs := flag.NewFlagSet("policy", flag.ExitOnError)
+	cloud := fs.String("cloud", config.DefaultCloud, "the policy as it governs this cloud")
+	_ = fs.Parse(args)
 	dir, err := config.Dir()
 	if err != nil {
 		return err
 	}
-	p, err := config.LoadPolicy(dir)
+	machine, err := config.LoadPolicy(dir)
+	if err != nil {
+		return err
+	}
+	p, err := config.LoadCloudPolicy(dir, *cloud, machine)
 	if err != nil {
 		return err
 	}
@@ -653,7 +755,7 @@ func showPolicy() error {
 		NetworkIsolationOn    bool               `json:"network_isolation_effective"`
 		StayAwakeEffective    bool               `json:"stay_awake_effective"`
 		SharedRunnerEffective bool               `json:"shared_runner_effective"`
-	}{p, config.PolicyPath(dir), resources(p), p.NetworkIsolation() && ex.NetworkIsolationAvailable(), p.StayAwakeEnabled(), p.SharedRunnerEnabled()}, "", "  ")
+	}{p, config.CloudPolicyPath(dir, *cloud), resources(machine), p.NetworkIsolation() && ex.NetworkIsolationAvailable(), p.StayAwakeEnabled(), p.SharedRunnerEnabled()}, "", "  ")
 	fmt.Println(string(b))
 	return nil
 }

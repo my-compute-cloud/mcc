@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"sync"
 	"time"
 
+	"github.com/my-compute-cloud/mcc/agent/internal/config"
 	"github.com/my-compute-cloud/mcc/agent/internal/protocol"
 	"github.com/my-compute-cloud/mcc/agent/internal/tasklog"
 )
@@ -29,11 +31,11 @@ const relayRefused = "no output for that task and secret on this host"
 // handleAttach starts sending a task's output to a caller attached through the control
 // plane. The caller proves it holds the task's secret, and every part is sealed for it: the
 // control plane, which carries the stream, can read none of it.
-func (a *Agent) handleAttach(ctx context.Context, m protocol.Attach) {
+func (c *cloud) handleAttach(ctx context.Context, m protocol.Attach) {
 	refuse := func(why string) {
-		a.send(&protocol.Output{Type: protocol.TypeOutput, StreamID: m.StreamID, Error: why})
+		c.send(&protocol.Output{Type: protocol.TypeOutput, StreamID: m.StreamID, Error: why})
 	}
-	store, key := a.o.TaskOutput, a.o.OutputKey
+	store, key := c.o.TaskOutput, c.o.OutputKey
 	if store == nil || key == nil {
 		refuse(relayRefused)
 		return
@@ -43,34 +45,35 @@ func (a *Agent) handleAttach(ctx context.Context, m protocol.Attach) {
 		refuse(relayRefused)
 		return
 	}
+	// A task's output is for the cloud that asked for the task, and no other.
 	meta, err := store.Meta(m.TaskID)
-	if err != nil || !meta.Allows(secret) || int64(m.Offset) > store.Size(m.TaskID) || m.Offset < 0 {
+	if err != nil || cmp.Or(meta.Cloud, config.DefaultCloud) != c.name || !meta.Allows(secret) || int64(m.Offset) > store.Size(m.TaskID) || m.Offset < 0 {
 		refuse(relayRefused)
 		return
 	}
 
 	sctx, cancel := context.WithCancel(ctx)
-	a.streams.mu.Lock()
-	if a.streams.cancel == nil {
-		a.streams.cancel = map[string]context.CancelFunc{}
+	c.streams.mu.Lock()
+	if c.streams.cancel == nil {
+		c.streams.cancel = map[string]context.CancelFunc{}
 	}
-	if _, dup := a.streams.cancel[m.StreamID]; dup || len(a.streams.cancel) >= maxStreams {
-		a.streams.mu.Unlock()
+	if _, dup := c.streams.cancel[m.StreamID]; dup || len(c.streams.cancel) >= maxStreams {
+		c.streams.mu.Unlock()
 		cancel()
 		refuse("this host is sending as many streams as it will; try again shortly")
 		return
 	}
-	a.streams.cancel[m.StreamID] = cancel
-	a.streams.mu.Unlock()
+	c.streams.cancel[m.StreamID] = cancel
+	c.streams.mu.Unlock()
 
 	go func() {
 		defer func() {
 			cancel()
-			a.streams.mu.Lock()
-			delete(a.streams.cancel, m.StreamID)
-			a.streams.mu.Unlock()
+			c.streams.mu.Lock()
+			delete(c.streams.cancel, m.StreamID)
+			c.streams.mu.Unlock()
 		}()
-		w := &partWriter{a: a, ch: ch, stream: m.StreamID, offset: int64(m.Offset), ctx: sctx}
+		w := &partWriter{c: c, ch: ch, stream: m.StreamID, offset: int64(m.Offset), ctx: sctx}
 		end, err := store.Copy(w, m.TaskID, int64(m.Offset), m.Follow, sctx.Done(), nil)
 		if sctx.Err() != nil {
 			return // the caller left, or the connection that carried the stream is gone
@@ -86,14 +89,14 @@ func (a *Agent) handleAttach(ctx context.Context, m protocol.Attach) {
 		case end.ExitCode != nil:
 			out.ExitCode = *end.ExitCode
 		}
-		a.send(out)
+		c.send(out)
 	}()
 }
 
-func (a *Agent) handleDetach(m protocol.Detach) {
-	a.streams.mu.Lock()
-	cancel := a.streams.cancel[m.StreamID]
-	a.streams.mu.Unlock()
+func (c *cloud) handleDetach(m protocol.Detach) {
+	c.streams.mu.Lock()
+	cancel := c.streams.cancel[m.StreamID]
+	c.streams.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -102,7 +105,7 @@ func (a *Agent) handleDetach(m protocol.Detach) {
 // partWriter sends what it is given as sealed parts of one stream, no faster than one per
 // partInterval: a task that prints a line at a time is read in fewer, larger parts.
 type partWriter struct {
-	a      *Agent
+	c      *cloud
 	ch     *tasklog.Channel
 	stream string
 	offset int64
@@ -119,7 +122,7 @@ func (w *partWriter) Write(p []byte) (int, error) {
 			return 0, w.ctx.Err()
 		}
 	}
-	ok := w.a.send(&protocol.Output{
+	ok := w.c.send(&protocol.Output{
 		Type: protocol.TypeOutput, StreamID: w.stream, Seq: int(w.n), Offset: int(w.offset),
 		Data: w.ch.SealPart(w.n, w.offset, p),
 	})

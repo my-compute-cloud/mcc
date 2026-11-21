@@ -18,6 +18,13 @@ let
   cfg = config.services.mcc-agent;
   home = "/Users/${cfg.user}";
   policyFile = pkgs.writeText "mcc-policy.json" (builtins.toJSON cfg.policy);
+  # One file per cloud, named as the agent looks for them (MCC_CLOUD_POLICY_DIR).
+  cloudPolicies = pkgs.linkFarm "mcc-cloud-policies" (
+    lib.mapAttrsToList (name: policy: {
+      name = "${name}.json";
+      path = pkgs.writeText "mcc-cloud-${name}.json" (builtins.toJSON policy);
+    }) cfg.clouds
+  );
 
   # Where launchd finds the agent's launcher: in the system profile, under a name that does
   # not change from one version to the next.
@@ -43,7 +50,8 @@ let
     }:/usr/bin:/bin:/usr/sbin:/sbin
     export MCC_HOME=${lib.escapeShellArg cfg.stateDir}
     ${lib.optionalString (cfg.policy != { }) "export MCC_POLICY_FILE=${policyFile}"}
-    if [ ! -f "$MCC_HOME/state.json" ]; then
+    ${lib.optionalString (cfg.clouds != { }) "export MCC_CLOUD_POLICY_DIR=${cloudPolicies}"}
+    if [ ! -f "$MCC_HOME/state.json" ] && ! ls "$MCC_HOME"/clouds/*/state.json >/dev/null 2>&1; then
       echo "The MCC agent is not enrolled; run: mcc enroll --server URL TOKEN" >&2
       # A clean exit, so that launchd does not keep restarting an unenrolled agent.
       exit 0
@@ -89,6 +97,23 @@ in
       description = ''
         Local policy, as the fields of policy.json (see docs/agent.md). When empty, the agent
         reads policy.json from the state directory, or uses its defaults.
+      '';
+    };
+
+    clouds = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
+      default = { };
+      example = {
+        acme = {
+          max_vms = 1;
+          allowed_github_urls = [ "https://github.com/acme" ];
+        };
+      };
+      description = ''
+        What each other cloud this machine is enrolled in may do here, by the name given to
+        `mcc enroll --cloud NAME`: the fields of a cloud's policy.json (see docs/agent.md). A
+        cloud not named here runs GitHub Actions jobs in VMs and nothing else. When empty, the
+        agent reads clouds/NAME/policy.json from the state directory.
       '';
     };
   };

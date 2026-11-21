@@ -82,6 +82,74 @@ State lives in `~/Library/Application Support/mcc` on a Mac and in `~/.config/mc
 | `policy.json` | Local policy (optional; `MCC_POLICY_FILE` points elsewhere) |
 | `runner/`, `runner-linux/` | Cached GitHub Actions runner for macOS and for Linux guests, shared read-only into VMs |
 | `kvm/` | On a Linux host: image bases, the files of running VMs, and the runner as a disk image |
+| `clouds/<name>/` | Another cloud this machine is enrolled in: its own `identity.key`, `state.json` and `policy.json`; see below |
+
+## One machine in several clouds
+
+A machine can be a host in more than one cloud: your own, and an organization's you offer it
+to. Enroll it again, under a name of your own for the second cloud:
+
+```bash
+mcc enroll --cloud acme --server https://<control plane> <token>
+```
+
+Signed in, `mcc enroll --cloud acme --pool <pool>` does the same for the cloud you chose when
+you signed in. The name is only ever used on this machine. A machine enrolled once is in the
+cloud `default`, whose files stay where they were.
+
+There is still one agent and one service. The agent holds a connection to each cloud, and a
+running agent connects a newly enrolled one by itself once it is idle. Each cloud knows the
+machine as a host of its own, with its own key, and nothing tells one cloud about another or
+about the other's work.
+
+**What a second cloud may do is not what the first may.** The policy file describes the
+machine, and what the cloud `default` may do. Another cloud starts with nothing you did not
+give it by name: it runs GitHub Actions jobs in VMs, from any image of that cloud, and nothing
+else. No tasks, no scripts, no work on the host itself, no Nix store, no uploaded output. Only
+`active_hours` carries over, because it says when the machine works at all. To give it more,
+or less, write `clouds/<name>/policy.json`:
+
+```json
+{
+  "max_vms": 1,
+  "allowed_github_urls": ["https://github.com/acme"]
+}
+```
+
+| Field | Without it | Meaning |
+|---|---|---|
+| `max_vms` | the machine's | The most VMs this cloud may have here at once; never more than the machine's |
+| `allowed_images`, `excluded_images` | any image of that cloud | As in the machine's policy |
+| `allowed_github_urls` | any | As in the machine's policy |
+| `active_hours` | the machine's | `""` for always |
+| `allowed_workloads`, `script_timeout_seconds` | GitHub runners only | As in the machine's policy |
+| `host_tasks` | off | `enabled`, `max` and `github_runner` only. The account and directory are the machine's, so the machine's policy must have `host_tasks` first |
+| `tasks` | none | Tasks this cloud may run. They are not the first cloud's tasks |
+| `share_nix_store` | `false` | As in the machine's policy |
+| `task_output.upload` | `false` | As in the machine's policy |
+
+Anything else in that file is refused, so that a field meant for the machine is not silently
+ignored. `mcc policy check` says what each cloud is permitted, and `mcc policy --cloud NAME`
+prints the policy as it governs one.
+
+What the clouds share is the machine:
+
+- **Capacity.** `max_vms`, the limit of two macOS guests and `host_tasks.max` count work from
+  every cloud together. Each cloud is told the smaller of what its own cap leaves and what the
+  machine has free, and told again when another cloud takes or gives back a slot. Two clouds
+  may still ask for the last slot at once; one is refused for want of room and its control
+  plane places the work elsewhere. Nothing reserves a share for a cloud: the first to ask gets
+  the slot. Each cloud's plan counts the machine as one of its hosts.
+- **Images and the runner.** A base image is kept by its source, so one that two clouds name
+  is fetched once.
+- **Draining and upgrading.** `mcc drain` and a newer agent drain the machine for every cloud.
+
+What they do not share: job caches. Each cloud other than the first has its own under
+`cache_dir/clouds/<name>`, whatever `cache_scope` says, and each may grow to `cache_max_gb`. A
+task's output can be read through the control plane only by the cloud that asked for the task.
+
+To take a machine out of a cloud, remove the host in that cloud's control plane and delete
+`clouds/<name>` (for the first, `state.json` and `identity.key`), then restart the agent.
 
 ## Checking a host
 
@@ -96,6 +164,10 @@ failure if anything stops work from running, and `--json` gives the same as a li
 findings, each with a `code` that does not change. Signed out, it looks at this machine only.
 
 `mcc policy check [FILE]` says in words what a policy file permits, before the agent reads it.
+
+On a machine in several clouds, `mcc check` names each cloud, says what each may do and
+whether the agent is connected to it. What the control plane knows is asked of the one cloud
+you are signed in to.
 
 One agent runs per state directory: it holds a lock on `agent.lock` there, which is how
 `mcc check` knows whether it is running. It also says what the agent has in hand, which is

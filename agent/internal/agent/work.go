@@ -149,23 +149,23 @@ const (
 const scriptEntry = "exec /bin/bash -s\n"
 
 // policyCheck returns why a start must be refused, with its code, or "".
-func (a *Agent) policyCheck(m protocol.Start) (reason, code string) {
+func (c *cloud) policyCheck(m protocol.Start) (reason, code string) {
 	if m.Isolation == protocol.IsolationHost {
-		return a.hostPolicyCheck(m)
+		return c.hostPolicyCheck(m)
 	}
-	p := a.o.Policy
-	if !p.Active(a.o.Now()) {
+	p := c.o.Policy
+	if !p.Active(c.o.Now()) {
 		return "outside active hours", codeRefusedCapacity
 	}
-	if p.RequireNetworkIsolation && !a.isolationOK {
+	if p.RequireNetworkIsolation && !c.isolationOK {
 		return "network isolation required by policy but unavailable", codeRefusedPolicy
 	}
 	if !p.ImageAllowed(m.Image.Source) {
 		return fmt.Sprintf("image %s not allowed by local policy", m.Image.Source), codeRefusedPolicy
 	}
-	a.mu.Lock()
-	known, ok := a.images[m.Image.Name]
-	a.mu.Unlock()
+	c.mu.Lock()
+	known, ok := c.images[m.Image.Name]
+	c.mu.Unlock()
 	if !ok || known.Source != m.Image.Source {
 		return fmt.Sprintf("image %s is not in this host's pool configuration", m.Image.Name), codeRefusedPolicy
 	}
@@ -197,14 +197,14 @@ func (a *Agent) policyCheck(m protocol.Start) (reason, code string) {
 	default:
 		return fmt.Sprintf("unsupported workload %q", m.Workload.Kind), codeRefusedPolicy
 	}
-	if a.activeCount() >= a.slotsTotal() {
+	if c.freeSlots() <= 0 {
 		return "no free slot", codeRefusedCapacity
 	}
 	platform := guestPlatform(m.Image)
-	if !slices.Contains(a.o.Executor.GuestPlatforms(), platform) {
+	if !slices.Contains(c.o.Executor.GuestPlatforms(), platform) {
 		return fmt.Sprintf("this host cannot run %s guests", platform), codeRefusedPolicy
 	}
-	if lim := a.guestLimit(platform); lim > 0 && a.activeOn(platform) >= lim {
+	if lim := c.guestLimit(platform); lim > 0 && c.activeOn(platform) >= lim {
 		return fmt.Sprintf("this host already runs %d %s guests, the most allowed", lim, platform), codeRefusedCapacity
 	}
 	return "", ""
@@ -212,19 +212,19 @@ func (a *Agent) policyCheck(m protocol.Start) (reason, code string) {
 
 // hostPolicyCheck is policyCheck for work that runs on the host itself. Such work is not
 // isolated from the host, so each thing it needs is something the owner said yes to.
-func (a *Agent) hostPolicyCheck(m protocol.Start) (reason, code string) {
-	p := a.o.Policy
-	if a.o.HostExecutor == nil || !p.HostTasks.Enabled {
+func (c *cloud) hostPolicyCheck(m protocol.Start) (reason, code string) {
+	p := c.o.Policy
+	if c.o.HostExecutor == nil || !p.HostTasks.Enabled {
 		return "this host does not run work without a VM (host_tasks in its policy)", codeRefusedPolicy
 	}
 	if p.RequireNetworkIsolation {
 		return "network isolation is required by policy, and work on the host itself has none", codeRefusedPolicy
 	}
-	if !p.Active(a.o.Now()) {
+	if !p.Active(c.o.Now()) {
 		return "outside active hours", codeRefusedCapacity
 	}
 	if m.Workload.Kind == workloadTask {
-		return a.taskPolicyCheck(m.Workload)
+		return c.taskPolicyCheck(m.Workload)
 	}
 	if m.Workload.Kind == workloadScript {
 		return "a script runs only in a VM, never on the host itself", codeRefusedPolicy
@@ -248,10 +248,10 @@ func (a *Agent) hostPolicyCheck(m protocol.Start) (reason, code string) {
 	if r.WorkFolder != "" && r.WorkFolder != "_work" {
 		return fmt.Sprintf("runner work folder %q is not allowed on the host", r.WorkFolder), codeRefusedPolicy
 	}
-	if a.hostRunner() == "" {
+	if c.hostRunner() == "" {
 		return "this host has no Actions runner yet", codeRefusedCapacity
 	}
-	if a.hostActive() >= a.hostSlots() {
+	if c.hostRoom() <= 0 {
 		return "no free host slot", codeRefusedCapacity
 	}
 	return "", ""
@@ -260,8 +260,8 @@ func (a *Agent) hostPolicyCheck(m protocol.Start) (reason, code string) {
 // taskPolicyCheck is the rest of hostPolicyCheck for a task. The control plane sends a name
 // and parameters; whether there is such a task, and what its parameters may be, is the owner's
 // policy alone.
-func (a *Agent) taskPolicyCheck(w protocol.Workload) (reason, code string) {
-	spec, ok := a.o.Policy.Tasks[w.Task]
+func (c *cloud) taskPolicyCheck(w protocol.Workload) (reason, code string) {
+	spec, ok := c.o.Policy.Tasks[w.Task]
 	if !ok {
 		return fmt.Sprintf("task %q is not declared in this host's policy", w.Task), codeRefusedPolicy
 	}
@@ -272,10 +272,10 @@ func (a *Agent) taskPolicyCheck(w protocol.Workload) (reason, code string) {
 	if err != nil {
 		return fmt.Sprintf("task %s: %v", w.Task, err), codeRefusedPolicy
 	}
-	if a.hostActive() >= a.hostSlots() {
+	if c.hostRoom() <= 0 {
 		return "no free host slot", codeRefusedCapacity
 	}
-	if spec.MaxConcurrent > 0 && a.activeTask(w.Task) >= spec.MaxConcurrent {
+	if spec.MaxConcurrent > 0 && c.activeTask(w.Task) >= spec.MaxConcurrent {
 		return fmt.Sprintf("task %s already has %d runs, the most allowed", w.Task, spec.MaxConcurrent), codeRefusedCapacity
 	}
 	return "", ""
@@ -305,8 +305,8 @@ func taskScript(command []string) string {
 
 // executeTask runs a declared task on the host itself, in a directory made for it and gone
 // afterwards. The run ends at the sooner of the owner's time limit and the request's.
-func (a *Agent) executeTask(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
-	spec := a.o.Policy.Tasks[m.Workload.Task]
+func (c *cloud) executeTask(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
+	spec := c.o.Policy.Tasks[m.Workload.Task]
 	params, _ := taskParams(m.Workload.Params)
 	env := []string{"MCC_TASK=" + m.Workload.Task}
 	for k, v := range params {
@@ -314,7 +314,7 @@ func (a *Agent) executeTask(ctx context.Context, as *assignment, m protocol.Star
 	}
 	slices.Sort(env)
 
-	ex := a.o.HostExecutor
+	ex := c.o.HostExecutor
 	h, err := ex.Start(ctx, m.AssignmentID, protocol.ImageSpec{}, executor.StartOptions{})
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -327,12 +327,12 @@ func (a *Agent) executeTask(ctx context.Context, as *assignment, m protocol.Star
 		return false, fmt.Sprintf("preparing the task's directory: %v", err)
 	}
 
-	return a.runToExit(ctx, as, m, lg, ex, h, executor.Command{Script: taskScript(spec.Command), Env: env}, spec.Timeout())
+	return c.runToExit(ctx, as, m, lg, ex, h, executor.Command{Script: taskScript(spec.Command), Env: env}, spec.Timeout())
 }
 
 // runToExit runs a task's or a script's command where the executor has made room for it, until
 // it exits, is stopped, or reaches the sooner of the owner's time limit and the request's.
-func (a *Agent) runToExit(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger, ex executor.Executor, h executor.Handle, cmd executor.Command, limit time.Duration) (bool, string) {
+func (c *cloud) runToExit(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger, ex executor.Executor, h executor.Handle, cmd executor.Command, limit time.Duration) (bool, string) {
 	if t := time.Duration(m.Workload.TimeoutSeconds) * time.Second; t > 0 && t < limit {
 		limit = t
 	}
@@ -343,17 +343,17 @@ func (a *Agent) runToExit(ctx context.Context, as *assignment, m protocol.Start,
 	// owner keeps any. None of it goes to the control plane.
 	var out io.Writer = io.Discard
 	var kept *tasklog.Log
-	if a.o.TaskOutput != nil {
+	if c.o.TaskOutput != nil {
 		id := m.Workload.TaskID
 		if id == "" {
 			id = m.AssignmentID
 		}
-		l, err := a.o.TaskOutput.Create(tasklog.Meta{ID: id, AssignmentID: m.AssignmentID, Task: cmp.Or(m.Workload.Task, m.Workload.Kind), SecretHash: m.Workload.OutputSecretHash})
+		l, err := c.o.TaskOutput.Create(tasklog.Meta{ID: id, Cloud: c.name, AssignmentID: m.AssignmentID, Task: cmp.Or(m.Workload.Task, m.Workload.Kind), SecretHash: m.Workload.OutputSecretHash})
 		if err != nil {
 			lg.Warn("the task's output will not be kept", "err", err)
 		} else {
 			out, kept = l, l
-			go a.o.TaskOutput.Prune()
+			go c.o.TaskOutput.Prune()
 		}
 	}
 	end := func(exitCode *int, code string) {
@@ -362,26 +362,26 @@ func (a *Agent) runToExit(ctx context.Context, as *assignment, m protocol.Start,
 		}
 		kept.Close(exitCode, code)
 		// Kept by the control plane too, if the tenant's plan asks and this host's owner agrees.
-		if m.Workload.StoreOutput && a.o.Policy.TaskOutput.Upload && m.Workload.TaskID != "" {
-			a.wg.Add(1)
+		if m.Workload.StoreOutput && c.o.Policy.TaskOutput.Upload && m.Workload.TaskID != "" {
+			c.wg.Add(1)
 			go func() {
-				defer a.wg.Done()
-				a.uploadOutput(m.Workload.TaskID, lg)
+				defer c.wg.Done()
+				c.uploadOutput(m.Workload.TaskID, lg)
 			}()
 		}
 	}
 
-	a.setState(as.id, protocol.AgentAssignmentStateRunning, "")
+	c.setState(as.id, protocol.AgentAssignmentStateRunning, "")
 	cmd.Output = out
 	code, err := ex.Exec(tctx, h, cmd)
 
 	switch {
-	case a.stopReason(as) != "":
-		a.setOutcome(as, codeStopped, 0)
+	case c.stopReason(as) != "":
+		c.setOutcome(as, codeStopped, 0)
 		end(nil, codeStopped)
-		return false, a.stopReason(as)
+		return false, c.stopReason(as)
 	case tctx.Err() == context.DeadlineExceeded:
-		a.setOutcome(as, codeTimeout, 0)
+		c.setOutcome(as, codeTimeout, 0)
 		end(nil, codeTimeout)
 		return false, fmt.Sprintf("stopped after its time limit of %s", limit)
 	case err != nil:
@@ -389,7 +389,7 @@ func (a *Agent) runToExit(ctx context.Context, as *assignment, m protocol.Start,
 		return false, fmt.Sprintf("running task: %v", err)
 	}
 	// It ran to an exit. That is "finished" whatever the exit code, which goes with it.
-	a.setOutcome(as, "", code)
+	c.setOutcome(as, "", code)
 	end(&code, "")
 	if code != 0 {
 		return true, fmt.Sprintf("exited with code %d", code)
@@ -398,10 +398,10 @@ func (a *Agent) runToExit(ctx context.Context, as *assignment, m protocol.Start,
 }
 
 // setOutcome records how a task ended, to go out with its last status.
-func (a *Agent) setOutcome(as *assignment, code string, exitCode int) {
-	a.mu.Lock()
+func (c *cloud) setOutcome(as *assignment, code string, exitCode int) {
+	c.mu.Lock()
 	as.code, as.exitCode = code, exitCode
-	a.mu.Unlock()
+	c.mu.Unlock()
 }
 
 // runnerSettings is what the agent reads of a just-in-time runner configuration.
@@ -438,36 +438,39 @@ func jitRunner(encoded string) (runnerSettings, error) {
 
 // jobCache is the cache directory for the repository or organization this job's runner
 // registers with.
-func (a *Agent) jobCache(m protocol.Start) (string, func(), error) {
+func (c *cloud) jobCache(m protocol.Start) (string, func(), error) {
 	r, err := jitRunner(m.Workload.JITConfig)
 	if err != nil {
 		return "", nil, fmt.Errorf("could not read the runner configuration to choose a cache: %w", err)
 	}
-	return a.o.Cache.Acquire(r.GitHubURL)
+	return c.o.Cache.Acquire(r.GitHubURL)
 }
 
-func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
-	a.mu.Lock()
-	if existing, ok := a.assignments[m.AssignmentID]; ok {
+func (c *cloud) handleStart(ctx context.Context, m protocol.Start) {
+	c.mu.Lock()
+	if existing, ok := c.assignments[m.AssignmentID]; ok {
 		// Repeated start: no further effect beyond restating where it is.
 		state, reason := existing.state, existing.reason
-		a.mu.Unlock()
-		a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: state, Reason: reason})
+		c.mu.Unlock()
+		c.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: state, Reason: reason})
 		return
 	}
-	a.mu.Unlock()
+	c.mu.Unlock()
 
 	// A start that was already on its way when the agent began to drain. Refused for want of
 	// capacity, which is the refusal the control plane takes elsewhere.
-	if why := a.Draining(); why != "" {
-		a.log.Info("refusing start: draining", "assignment", m.AssignmentID, "why", why)
-		a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: this host is draining (" + why + ")", Code: codeRefusedCapacity})
+	if why := c.Draining(); why != "" {
+		c.log.Info("refusing start: draining", "assignment", m.AssignmentID, "why", why)
+		c.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: this host is draining (" + why + ")", Code: codeRefusedCapacity})
 		return
 	}
 
-	if reason, code := a.policyCheck(m); reason != "" {
-		a.log.Warn("refusing start", "assignment", m.AssignmentID, "reason", reason)
-		a.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: " + reason, Code: code})
+	// Checked and counted as one step: another cloud may be asking for the same slot.
+	c.a.admit.Lock()
+	if reason, code := c.policyCheck(m); reason != "" {
+		c.a.admit.Unlock()
+		c.log.Warn("refusing start", "assignment", m.AssignmentID, "reason", reason)
+		c.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: " + reason, Code: code})
 		return
 	}
 
@@ -482,20 +485,27 @@ func (a *Agent) handleStart(ctx context.Context, m protocol.Start) {
 		as.platform = guestPlatform(m.Image)
 		as.script = m.Workload.Kind == workloadScript
 	}
-	a.mu.Lock()
-	a.assignments[m.AssignmentID] = as
-	a.mu.Unlock()
-	a.wg.Add(1)
+	c.mu.Lock()
+	c.assignments[m.AssignmentID] = as
+	c.mu.Unlock()
+	c.a.admit.Unlock()
+	// What this cloud took, the others no longer have.
+	for _, other := range c.a.clouds {
+		if other != c {
+			other.sendCapacity()
+		}
+	}
+	c.wg.Add(1)
 	go func() {
-		defer a.wg.Done()
+		defer c.wg.Done()
 		defer cancel()
-		a.runAssignment(wctx, as, m)
+		c.runAssignment(wctx, as, m)
 	}()
 }
 
-func (a *Agent) handleStop(m protocol.Stop) {
-	a.mu.Lock()
-	as := a.assignments[m.AssignmentID]
+func (c *cloud) handleStop(m protocol.Stop) {
+	c.mu.Lock()
+	as := c.assignments[m.AssignmentID]
 	if as != nil && as.cancel != nil {
 		as.stopReason = "stopped by control plane"
 		if m.Reason != "" {
@@ -503,55 +513,55 @@ func (a *Agent) handleStop(m protocol.Stop) {
 		}
 		as.cancel()
 	}
-	a.mu.Unlock()
+	c.mu.Unlock()
 	if as == nil {
-		a.log.Info("stop for unknown assignment", "assignment", m.AssignmentID)
+		c.log.Info("stop for unknown assignment", "assignment", m.AssignmentID)
 	}
 }
 
-func (a *Agent) stopReason(as *assignment) string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (c *cloud) stopReason(as *assignment) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return as.stopReason
 }
 
 // runAssignment runs one assignment to completion. The final status is sent only after the
 // VM has been deleted, or the work's directory on the host.
-func (a *Agent) runAssignment(ctx context.Context, as *assignment, m protocol.Start) {
-	lg := a.log.With("assignment", m.AssignmentID)
+func (c *cloud) runAssignment(ctx context.Context, as *assignment, m protocol.Start) {
+	lg := c.log.With("assignment", m.AssignmentID)
 	if as.host {
 		lg = lg.With("isolation", "host")
 	} else {
 		lg = lg.With("image", m.Image.Name)
 	}
-	a.setState(as.id, protocol.AgentAssignmentStateStarting, "")
-	if a.o.Policy.StayAwakeEnabled() {
-		a.awake.Acquire()
-		defer a.awake.Release()
+	c.setState(as.id, protocol.AgentAssignmentStateStarting, "")
+	if c.o.Policy.StayAwakeEnabled() {
+		c.awake.Acquire()
+		defer c.awake.Release()
 	}
 	var ok bool
 	var reason string
 	if as.task != "" {
 		lg = lg.With("task", as.task)
-		ok, reason = a.executeTask(ctx, as, m, lg)
+		ok, reason = c.executeTask(ctx, as, m, lg)
 	} else if as.host {
-		ok, reason = a.executeOnHost(ctx, as, m, lg)
+		ok, reason = c.executeOnHost(ctx, as, m, lg)
 	} else {
-		ok, reason = a.execute(ctx, as, m, lg)
+		ok, reason = c.execute(ctx, as, m, lg)
 	}
-	a.finish(as, lg, ok, reason)
+	c.finish(as, lg, ok, reason)
 }
 
 // executeOnHost runs a runner on the host itself: in a directory made for it, holding a copy
 // of the host's runner, both gone afterwards.
-func (a *Agent) executeOnHost(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
-	ex := a.o.HostExecutor
-	runner := a.hostRunner()
+func (c *cloud) executeOnHost(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
+	ex := c.o.HostExecutor
+	runner := c.hostRunner()
 	if runner == "" {
 		return false, "this host has no Actions runner yet"
 	}
 	opts := executor.StartOptions{SharedDirs: map[string]executor.SharedDir{runnerShare: {Path: runner}}}
-	if a.o.Policy.HostTasks.Persistent() {
+	if c.o.Policy.HostTasks.Persistent() {
 		// The runner is new for every job; only its work folder is kept, for the repository or
 		// organization the runner registers with and no one else. Downloaded actions and
 		// temporary files are not kept: the next job would run a cached action as it found it.
@@ -566,14 +576,14 @@ func (a *Agent) executeOnHost(ctx context.Context, as *assignment, m protocol.St
 		}}
 	}
 	var env []string
-	if a.o.Cache != nil {
-		if dir, release, err := a.jobCache(m); err != nil {
+	if c.o.Cache != nil {
+		if dir, release, err := c.jobCache(m); err != nil {
 			lg.Warn("running without a cache", "err", err)
 		} else {
 			env = append(env, "MCC_CACHE_DIR="+dir)
 			defer func() {
 				release()
-				go a.o.Cache.Prune()
+				go c.o.Cache.Prune()
 			}()
 		}
 	}
@@ -590,66 +600,66 @@ func (a *Agent) executeOnHost(ctx context.Context, as *assignment, m protocol.St
 	if err != nil {
 		return false, fmt.Sprintf("preparing the work's directory: %v", err)
 	}
-	return a.runRunner(ctx, as, m, lg, ex, h, hostRunnerScript, env)
+	return c.runRunner(ctx, as, m, lg, ex, h, hostRunnerScript, env)
 }
 
-func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
+func (c *cloud) execute(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger) (bool, string) {
 
-	if !a.o.Executor.Ready(ctx, m.Image) {
+	if !c.o.Executor.Ready(ctx, m.Image) {
 		lg.Info("preparing image before start")
-		if err := a.o.Executor.Prepare(ctx, m.Image); err != nil {
+		if err := c.o.Executor.Prepare(ctx, m.Image); err != nil {
 			return false, fmt.Sprintf("preparing image: %v", err)
 		}
-		a.mu.Lock()
-		a.ready[m.Image.Name] = true
-		a.mu.Unlock()
+		c.mu.Lock()
+		c.ready[m.Image.Name] = true
+		c.mu.Unlock()
 	}
 
 	opts := executor.StartOptions{
-		Resources:      a.o.Resources,
-		IsolateNetwork: a.o.Policy.NetworkIsolation() && a.isolationOK,
+		Resources:      c.o.Resources,
+		IsolateNetwork: c.o.Policy.NetworkIsolation() && c.isolationOK,
 	}
 	opts.SharedDirs = map[string]executor.SharedDir{}
 	// A script is not a GitHub job: it gets no runner and no job cache, only the VM.
 	runner := m.Workload.Kind == workloadGitHubRunner
-	if runner && a.o.Policy.SharedRunnerEnabled() && a.o.Runner != nil {
-		if dir := a.o.Runner.Current(guestPlatform(m.Image)); dir != "" {
+	if runner && c.o.Policy.SharedRunnerEnabled() && c.o.Runner != nil {
+		if dir := c.o.Runner.Current(guestPlatform(m.Image)); dir != "" {
 			opts.SharedDirs[runnerShare] = executor.SharedDir{Path: dir}
 		}
 	}
-	if runner && a.o.Cache != nil {
+	if runner && c.o.Cache != nil {
 		// A job that cannot be placed in a cache runs without one rather than sharing
 		// someone else's.
-		if dir, release, err := a.jobCache(m); err != nil {
+		if dir, release, err := c.jobCache(m); err != nil {
 			lg.Warn("running without a cache", "err", err)
 		} else {
 			opts.SharedDirs[cacheShare] = executor.SharedDir{Path: dir, Writable: true}
 			// Registered before the VM's own cleanup, so it runs after the VM is gone.
 			defer func() {
 				release()
-				go a.o.Cache.Prune()
+				go c.o.Cache.Prune()
 			}()
 		}
 	}
-	if runner && a.o.HostNix != nil {
+	if runner && c.o.HostNix != nil {
 		// A job that cannot have the host's store runs without it, as on any other host.
-		if dir, remove, err := a.o.HostNix.Snapshot(ctx, m.AssignmentID); err != nil {
+		if dir, remove, err := c.o.HostNix.Snapshot(ctx, m.AssignmentID); err != nil {
 			lg.Warn("running without the host's Nix store", "err", err)
 		} else {
-			opts.SharedDirs[nixStoreShare] = executor.SharedDir{Path: a.o.HostNix.Store()}
+			opts.SharedDirs[nixStoreShare] = executor.SharedDir{Path: c.o.HostNix.Store()}
 			opts.SharedDirs[nixStateShare] = executor.SharedDir{Path: dir}
 			defer remove()
 		}
 	}
 	started := time.Now()
-	h, err := a.o.Executor.Start(ctx, m.AssignmentID, m.Image, opts)
+	h, err := c.o.Executor.Start(ctx, m.AssignmentID, m.Image, opts)
 	if err != nil {
 		return false, fmt.Sprintf("starting VM: %v", err)
 	}
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		if err := a.o.Executor.Stop(stopCtx, h); err != nil {
+		if err := c.o.Executor.Stop(stopCtx, h); err != nil {
 			lg.Error("deleting VM failed", "vm", h.Name, "err", err)
 		} else {
 			lg.Info("VM deleted", "vm", h.Name)
@@ -658,15 +668,15 @@ func (a *Agent) execute(ctx context.Context, as *assignment, m protocol.Start, l
 	lg.Info("VM started", "vm", h.Name, "boot", time.Since(started).Round(time.Millisecond))
 
 	if !runner {
-		return a.runToExit(ctx, as, m, lg, a.o.Executor, h,
-			executor.Command{Script: scriptEntry, Stdin: strings.NewReader(m.Workload.Script)}, a.o.Policy.ScriptTimeout())
+		return c.runToExit(ctx, as, m, lg, c.o.Executor, h,
+			executor.Command{Script: scriptEntry, Stdin: strings.NewReader(m.Workload.Script)}, c.o.Policy.ScriptTimeout())
 	}
-	return a.runRunner(ctx, as, m, lg, a.o.Executor, h, entryScript(m.Image), nil)
+	return c.runRunner(ctx, as, m, lg, c.o.Executor, h, entryScript(m.Image), nil)
 }
 
 // runRunner runs the runner's entry command where the executor has made room for it, and
 // watches its output for the job being taken.
-func (a *Agent) runRunner(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger, ex executor.Executor, h executor.Handle, script string, env []string) (bool, string) {
+func (c *cloud) runRunner(ctx context.Context, as *assignment, m protocol.Start, lg *slog.Logger, ex executor.Executor, h executor.Handle, script string, env []string) (bool, string) {
 	var busy atomic.Bool
 	// What the runner said last before any job, kept to explain a runner that never took one.
 	var last lastLines
@@ -694,16 +704,16 @@ func (a *Agent) runRunner(ctx context.Context, as *assignment, m protocol.Start,
 	if t := time.Duration(m.Workload.IdleTimeoutSeconds) * time.Second; t > 0 {
 		timer := time.AfterFunc(t, func() {
 			if !busy.Load() {
-				a.mu.Lock()
+				c.mu.Lock()
 				as.stopReason = "idle timeout"
-				a.mu.Unlock()
+				c.mu.Unlock()
 				as.cancel()
 			}
 		})
 		defer timer.Stop()
 	}
 
-	a.setState(as.id, protocol.AgentAssignmentStateRunning, "")
+	c.setState(as.id, protocol.AgentAssignmentStateRunning, "")
 	code, err := ex.Exec(ctx, h, executor.Command{
 		Script: script,
 		Env:    env,
@@ -714,8 +724,8 @@ func (a *Agent) runRunner(ctx context.Context, as *assignment, m protocol.Start,
 	<-read
 
 	switch {
-	case a.stopReason(as) != "":
-		return true, a.stopReason(as)
+	case c.stopReason(as) != "":
+		return true, c.stopReason(as)
 	case err != nil:
 		return busy.Load(), fmt.Sprintf("running workload: %v", err)
 	case code != 0 && !busy.Load():
@@ -765,11 +775,11 @@ func (l *lastLines) String() string {
 	return strings.Join(l.lines, " | ")
 }
 
-func (a *Agent) finish(as *assignment, lg interface{ Info(string, ...any) }, ok bool, reason string) {
+func (c *cloud) finish(as *assignment, lg interface{ Info(string, ...any) }, ok bool, reason string) {
 	state := protocol.AgentAssignmentStateFinished
 	if !ok {
 		state = protocol.AgentAssignmentStateFailed
 	}
 	lg.Info("assignment ended", "state", state, "reason", reason)
-	a.setState(as.id, state, reason)
+	c.setState(as.id, state, reason)
 }

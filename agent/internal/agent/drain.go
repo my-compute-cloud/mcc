@@ -28,7 +28,7 @@ func (a *Agent) Drain(reason string) {
 	a.mu.Unlock()
 	if !already {
 		a.log.Info("draining: no new work is taken, and what is running goes on", "why", reason)
-		a.sendCapacity()
+		a.announce()
 	}
 }
 
@@ -47,10 +47,12 @@ func (a *Agent) Resume(reason string) {
 		a.log.Info("no longer draining")
 		// Images that were asked for while draining were not started.
 		if ctx != nil {
-			a.prepareMissing(ctx)
+			for _, c := range a.clouds {
+				c.prepareMissing(ctx)
+			}
 		}
 	}
-	a.sendCapacity()
+	a.announce()
 }
 
 // Draining is why the agent is draining, or "" if it is not. An upgrade is named first: it
@@ -76,7 +78,16 @@ func (a *Agent) drainingLocked() string {
 func (a *Agent) Idle() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return len(a.assignments) == 0 && len(a.preparing) == 0 && a.refreshing == 0
+	return a.idleLocked()
+}
+
+func (a *Agent) idleLocked() bool {
+	for _, c := range a.clouds {
+		if len(c.assignments) > 0 {
+			return false
+		}
+	}
+	return len(a.preparing) == 0 && a.refreshing == 0
 }
 
 // WaitIdle returns nil once the agent is idle, or ctx's error.
@@ -102,9 +113,12 @@ type Activity struct {
 	// build of their own in the service's place with `mcc use`.
 	Executable string `json:"executable"`
 	Installed  bool   `json:"installed"`
-	// Connected is whether it has a connection to the control plane now.
-	Connected bool           `json:"connected"`
-	Work      []ActivityWork `json:"work"`
+	// Connected is whether it has a connection to the control plane now: to every cloud's, on
+	// a machine enrolled in several.
+	Connected bool `json:"connected"`
+	// Clouds are the clouds this machine is enrolled in.
+	Clouds []ActivityCloud `json:"clouds"`
+	Work   []ActivityWork  `json:"work"`
 	// Preparing lists images being fetched or made ready.
 	Preparing []string `json:"preparing"`
 	// Draining is why it takes no new work, or "".
@@ -112,9 +126,21 @@ type Activity struct {
 	Idle     bool   `json:"idle"`
 }
 
+// ActivityCloud is one enrollment and whether its control plane is connected.
+type ActivityCloud struct {
+	Name      string `json:"name"`
+	Server    string `json:"server"`
+	HostID    string `json:"host_id"`
+	Connected bool   `json:"connected"`
+	// Work is how much this cloud has running here.
+	Work int `json:"work"`
+}
+
 // ActivityWork is one piece of work the agent has.
 type ActivityWork struct {
-	ID    string                        `json:"id"`
+	ID string `json:"id"`
+	// Cloud is the name, on this machine, of the cloud it is for.
+	Cloud string                        `json:"cloud"`
 	State protocol.AgentAssignmentState `json:"state"`
 	// Kind is "task", "script" or "job" (a GitHub Actions job).
 	Kind string `json:"kind"`
@@ -131,24 +157,29 @@ func (a *Agent) Activity() Activity {
 		Version:    Version,
 		Executable: executable,
 		Installed:  isInstalled,
-		Connected:  a.conn != nil,
+		Connected:  true,
+		Clouds:     []ActivityCloud{},
 		Work:       []ActivityWork{},
 		Preparing:  []string{},
 		Draining:   a.drainingLocked(),
-		Idle:       len(a.assignments) == 0 && len(a.preparing) == 0 && a.refreshing == 0,
+		Idle:       a.idleLocked(),
 	}
-	for _, as := range a.assignments {
-		kind := "job"
-		switch {
-		case as.task != "":
-			kind = "task"
-		case as.script:
-			kind = "script"
+	for _, c := range a.clouds {
+		out.Connected = out.Connected && c.conn != nil
+		out.Clouds = append(out.Clouds, ActivityCloud{Name: c.name, Server: c.o.ServerURL, HostID: c.o.HostID, Connected: c.conn != nil, Work: len(c.assignments)})
+		for _, as := range c.assignments {
+			kind := "job"
+			switch {
+			case as.task != "":
+				kind = "task"
+			case as.script:
+				kind = "script"
+			}
+			out.Work = append(out.Work, ActivityWork{ID: as.id, Cloud: c.name, State: as.state, Kind: kind, Task: as.task, OnHost: as.host})
 		}
-		out.Work = append(out.Work, ActivityWork{ID: as.id, State: as.state, Kind: kind, Task: as.task, OnHost: as.host})
 	}
 	sort.Slice(out.Work, func(i, j int) bool { return out.Work[i].ID < out.Work[j].ID })
-	for name := range a.preparing {
+	for _, name := range a.preparing {
 		out.Preparing = append(out.Preparing, name)
 	}
 	sort.Strings(out.Preparing)
@@ -160,6 +191,7 @@ func (a *Agent) Activity() Activity {
 //	GET  /v1/status   what the agent is doing (Activity)
 //	POST /v1/drain    stop taking new work
 //	POST /v1/resume   take work again
+//	POST /v1/reload   start again once idle, to read what changed: a cloud enrolled, a policy
 //	POST /v1/switch   become another build once idle: {"path": "...", "argv": [...]}; no path
 //	                  means the installed agent
 //
@@ -177,6 +209,13 @@ func (a *Agent) ControlHandler() http.Handler {
 			a.Drain(DrainOwner)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/resume":
 			a.Resume(DrainOwner)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/reload":
+			if err := a.Reload(); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/switch":
 			var req struct {
 				Path string   `json:"path"`

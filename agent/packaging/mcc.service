@@ -15,7 +15,9 @@ Description=My Compute Cloud agent
 Documentation=https://github.com/my-compute-cloud/mcc/blob/main/docs/agent.md
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=/var/lib/mcc/state.json
+# Enrolled in at least one cloud: the first, or one added with `mcc enroll --cloud NAME`.
+ConditionPathExists=|/var/lib/mcc/state.json
+ConditionPathExistsGlob=|/var/lib/mcc/clouds/*/state.json
 
 [Service]
 User=mcc
