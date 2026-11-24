@@ -81,6 +81,11 @@ func BaseName(source string) string {
 // so that a change to that (another Xcode, or none) makes a new base rather than reusing one
 // with the wrong contents.
 func (t *Tart) base(ctx context.Context, image protocol.ImageSpec) (string, error) {
+	// A job VM or a base is not an image, whoever asks: one holds another job's work, and the
+	// name of one not yet made would be cloned the moment it appears.
+	if strings.HasPrefix(strings.ToLower(image.Source), jobPrefix) {
+		return "", fmt.Errorf("image source %s names one of the agent's own VMs", image.Source)
+	}
 	name := BaseName(image.Source)
 	if t.preloads(image) {
 		return name + "-" + executor.PreloadKey(t.Preload), nil

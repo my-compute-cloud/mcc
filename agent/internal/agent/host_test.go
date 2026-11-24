@@ -129,6 +129,11 @@ func TestHostWorkIsRefusedUnlessTheOwnerAllowsIt(t *testing.T) {
 		files, _ := json.Marshal(map[string]string{".runner": runner})
 		return base64.StdEncoding.EncodeToString(files)
 	}
+	strayFile := func() string {
+		runner := base64.StdEncoding.EncodeToString([]byte(`{"gitHubUrl":"` + acme + `"}`))
+		files, _ := json.Marshal(map[string]string{".runner": runner, "../../.ssh/authorized_keys": "e30="})
+		return base64.StdEncoding.EncodeToString(files)
+	}
 	cases := []struct {
 		name   string
 		policy func(*config.Policy)
@@ -142,6 +147,7 @@ func TestHostWorkIsRefusedUnlessTheOwnerAllowsIt(t *testing.T) {
 		{"someone else's repository", nil, oneRunner("x"), jitFor("https://github.com/other"), "not allowed by local policy", "refused_policy"},
 		{"no list of whose workflows", func(p *config.Policy) { p.AllowedGitHubURLs = nil }, oneRunner("x"), jitFor(acme), "not allowed by local policy", "refused_policy"},
 		{"a work folder outside the job", nil, oneRunner("x"), workFolder("/Users/someone"), "work folder", "refused_policy"},
+		{"a file that is not a runner's", nil, oneRunner("x"), strayFile(), "names a file", "refused_policy"},
 		{"network isolation required", func(p *config.Policy) { p.RequireNetworkIsolation = true }, oneRunner("x"), jitFor(acme), "network isolation", "refused_policy"},
 		{"no runner yet", nil, oneRunner(""), jitFor(acme), "no Actions runner", "refused_capacity"},
 	}
@@ -385,6 +391,44 @@ func TestATaskIsRefusedUnlessItIsOneTheOwnerDeclared(t *testing.T) {
 				t.Errorf("refused work was given a directory: %v", entries)
 			}
 		})
+	}
+}
+
+func TestAStartWhoseIDIsNotAPlainNameIsRefusedBeforeAnythingIsTouched(t *testing.T) {
+	for _, id := range []string{"../policy", "../../..", "a/b", "/etc/x", ".."} {
+		t.Run(id, func(t *testing.T) {
+			record := filepath.Join(t.TempDir(), "record")
+			cp, _, px := startHostAgent(t, taskPolicy(t, record, "exit 0"), oneRunner(""))
+			<-cp.hellos
+			// A file where the state file of "../policy" would be.
+			beside := filepath.Join(filepath.Dir(px.StateDir), "policy.json")
+			if err := os.MkdirAll(filepath.Dir(beside), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(beside, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cp.send(taskStart(id, "build", nil, 0))
+			m := cp.next(status(id, "failed"))
+			if !strings.Contains(m["reason"].(string), "not a plain name") || m["code"] != "refused_policy" {
+				t.Fatalf("refusal %v", m)
+			}
+			if _, err := os.Stat(record); err == nil {
+				t.Error("the refused task ran")
+			}
+			if _, err := os.Stat(beside); err != nil {
+				t.Errorf("refusing it deleted a file: %v", err)
+			}
+		})
+	}
+	// A task id is a file name too: it is what the task's output is kept under.
+	cp, _, _ := startHostAgent(t, taskPolicy(t, filepath.Join(t.TempDir(), "record"), "exit 0"), oneRunner(""))
+	<-cp.hellos
+	m := taskStart("r1", "build", nil, 0)
+	m["workload"].(map[string]any)["task_id"] = "../../x"
+	cp.send(m)
+	if got := cp.next(status("r1", "failed")); got["code"] != "refused_policy" {
+		t.Fatalf("refusal %v", got)
 	}
 }
 

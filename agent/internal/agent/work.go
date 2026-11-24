@@ -8,9 +8,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -174,6 +176,10 @@ func (c *cloud) policyCheck(m protocol.Start) (reason, code string) {
 		if !p.WorkloadAllowed(workloadGitHubRunner) {
 			return "GitHub Actions jobs are not allowed on this host (allowed_workloads in its policy)", codeRefusedPolicy
 		}
+		// The runner writes each entry of its configuration as a file, under the entry's name.
+		if _, err := jitRunner(m.Workload.JITConfig); errors.Is(err, errRunnerFiles) {
+			return err.Error(), codeRefusedPolicy
+		}
 		if len(p.AllowedGitHubURLs) > 0 {
 			r, err := jitRunner(m.Workload.JITConfig)
 			if err != nil {
@@ -236,6 +242,9 @@ func (c *cloud) hostPolicyCheck(m protocol.Start) (reason, code string) {
 		return "GitHub Actions jobs may not run on this host itself (host_tasks.github_runner in its policy)", codeRefusedPolicy
 	}
 	r, err := jitRunner(m.Workload.JITConfig)
+	if errors.Is(err, errRunnerFiles) {
+		return err.Error(), codeRefusedPolicy
+	}
 	if err != nil {
 		return "could not read runner configuration to check allowed_github_urls", codeRefusedPolicy
 	}
@@ -411,6 +420,13 @@ type runnerSettings struct {
 	WorkFolder string `json:"workFolder"`
 }
 
+// runnerFiles are the files a just-in-time runner configuration holds. The runner writes each
+// entry under its name, so a name that is none of these could be a file anywhere.
+var runnerFiles = map[string]bool{".runner": true, ".credentials": true, ".credentials_rsaparams": true}
+
+// errRunnerFiles is a runner configuration refused for a file it names.
+var errRunnerFiles = errors.New("the runner configuration names a file that is not part of a runner's configuration")
+
 // jitRunner reads the runner's settings from a just-in-time runner configuration: base64 JSON
 // mapping runner file names to base64 file contents.
 func jitRunner(encoded string) (runnerSettings, error) {
@@ -422,6 +438,11 @@ func jitRunner(encoded string) (runnerSettings, error) {
 	var files map[string]string
 	if err := json.Unmarshal(raw, &files); err != nil {
 		return settings, err
+	}
+	for name := range files {
+		if !runnerFiles[name] {
+			return settings, errRunnerFiles
+		}
 	}
 	runner, err := base64.StdEncoding.DecodeString(files[".runner"])
 	if err != nil {
@@ -446,7 +467,17 @@ func (c *cloud) jobCache(m protocol.Start) (string, func(), error) {
 	return c.o.Cache.Acquire(r.GitHubURL)
 }
 
+// idPattern is what an id from the control plane may be: one file name, with nothing in it
+// that a path reads as a way out. The ids become names of directories, state files and VMs.
+var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$`)
+
 func (c *cloud) handleStart(ctx context.Context, m protocol.Start) {
+	// Before anything is done with them: every later step trusts these to be plain names.
+	if !idPattern.MatchString(m.AssignmentID) || (m.Workload.TaskID != "" && !idPattern.MatchString(m.Workload.TaskID)) {
+		c.log.Warn("refusing start: malformed id", "assignment", m.AssignmentID, "task", m.Workload.TaskID)
+		c.send(&protocol.Status{Type: protocol.TypeStatus, AssignmentID: m.AssignmentID, State: protocol.AgentAssignmentStateFailed, Reason: "refused: the assignment or task id is not a plain name", Code: codeRefusedPolicy})
+		return
+	}
 	c.mu.Lock()
 	if existing, ok := c.assignments[m.AssignmentID]; ok {
 		// Repeated start: no further effect beyond restating where it is.

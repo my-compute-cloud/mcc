@@ -70,6 +70,10 @@ var nixStateDirs = []string{
 // Snapshot makes a state directory for one job: a copy of the database as it is now, and
 // the empty directories Nix looks for. The caller removes it with the returned function.
 func (n *HostNix) Snapshot(ctx context.Context, id string) (string, func(), error) {
+	// The directory is deleted afterwards, so it must be one of ours and nothing above it.
+	if !idPattern.MatchString(id) {
+		return "", nil, fmt.Errorf("id %q cannot name a directory", id)
+	}
 	dir := filepath.Join(n.Work, id)
 	remove := func() { _ = os.RemoveAll(dir) }
 	for _, d := range nixStateDirs {

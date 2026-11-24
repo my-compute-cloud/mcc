@@ -505,13 +505,55 @@ func (h HostTasks) validate(p Policy) error {
 // It starts with a letter or digit, so a reference can never be read as an option.
 var containerImage = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
 
+// ownImagePrefix starts the name of every VM the agent makes: job VMs and the bases they are
+// cloned from. The executors use the same prefix.
+const ownImagePrefix = "mcc-"
+
+// LocalImage reports whether an image source names something on this host, not an image in a
+// registry: a VM by its name, or a directory by its path. A registry reference starts with
+// the registry's host and a slash.
+func LocalImage(source string) bool {
+	return strings.Index(source, "/") <= 0 || strings.HasPrefix(source, ".")
+}
+
 // ImageAllowed reports whether policy permits an image source: no excluded pattern matches
-// it, and an allowed one does, or there are none.
+// it, and an allowed one does, or there are none. A source on this host is the owner's own,
+// and the control plane may name it only when a pattern says so. What the agent made itself,
+// or a job could have written, is never an image.
 func (p Policy) ImageAllowed(source string) bool {
 	if matchesImage(p.ExcludedImages, source) {
 		return false
 	}
-	return len(p.AllowedImages) == 0 || matchesImage(p.AllowedImages, source)
+	if !LocalImage(source) {
+		return len(p.AllowedImages) == 0 || matchesImage(p.AllowedImages, source)
+	}
+	if strings.HasPrefix(strings.ToLower(source), ownImagePrefix) {
+		return false
+	}
+	if filepath.IsAbs(source) {
+		// A pattern is matched against the text, so the text must be the path it reads as.
+		if filepath.Clean(source) != source || within(p.CacheDir, source) {
+			return false
+		}
+	}
+	return matchesImage(p.AllowedImages, source)
+}
+
+// within reports whether a path is a directory or inside it, also once links are followed.
+func within(dir, path string) bool {
+	if dir == "" {
+		return false
+	}
+	inside := func(dir, path string) bool {
+		rel, err := filepath.Rel(dir, path)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	if inside(filepath.Clean(dir), path) {
+		return true
+	}
+	realDir, err1 := filepath.EvalSymlinks(dir)
+	realPath, err2 := filepath.EvalSymlinks(path)
+	return err1 == nil && err2 == nil && inside(realDir, realPath)
 }
 
 // matchesImage reports whether any of the patterns matches an image source. A trailing *

@@ -147,6 +147,21 @@ func TestAnAssignmentIDCannotLeaveTheWorkDirectory(t *testing.T) {
 			t.Errorf("Start(%q) should fail", id)
 		}
 	}
+	// Cleaning up after a start that was refused touches nothing: the state file such an id
+	// names would be some other file.
+	policy := filepath.Join(filepath.Dir(p.StateDir), "policy.json")
+	if err := os.MkdirAll(filepath.Dir(policy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(policy, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background(), executor.Handle{AssignmentID: "../policy"}); err != nil {
+		t.Errorf("Stop of a refused id: %v", err)
+	}
+	if _, err := os.Stat(policy); err != nil {
+		t.Errorf("Stop deleted a file outside the state directory: %v", err)
+	}
 	// Nor can a state file send Stop to a directory that is not the work's.
 	victim := t.TempDir()
 	if err := p.writeState(state{AssignmentID: "evil", Dir: victim}); err != nil {

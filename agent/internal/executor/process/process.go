@@ -293,6 +293,11 @@ func (p *Process) signal(pid int, sig syscall.Signal) {
 
 // Stop ends whatever the work left running and deletes its directory.
 func (p *Process) Stop(ctx context.Context, h executor.Handle) error {
+	// Start refused such an id, so there is nothing of ours under it, and its state file's
+	// path would be some other file's.
+	if !idPattern.MatchString(h.AssignmentID) {
+		return nil
+	}
 	p.mu.Lock()
 	j := p.jobs[h.AssignmentID]
 	delete(p.jobs, h.AssignmentID)

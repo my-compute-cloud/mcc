@@ -63,6 +63,23 @@ func TestNixSnapshotIsAWholeDatabase(t *testing.T) {
 	}
 }
 
+func TestANixSnapshotIsOnlyEverMadeInsideItsWorkDirectory(t *testing.T) {
+	n := fakeNix(t)
+	beside := filepath.Join(filepath.Dir(n.Work), "keep")
+	if err := os.WriteFile(beside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"..", "../..", "a/b", "/tmp/x", "", "."} {
+		if _, remove, err := n.Snapshot(context.Background(), id); err == nil {
+			remove()
+			t.Errorf("Snapshot(%q) should fail", id)
+		}
+	}
+	if _, err := os.Stat(beside); err != nil {
+		t.Errorf("a refused snapshot removed what was beside the work directory: %v", err)
+	}
+}
+
 func TestJobsGetTheHostsNixStoreReadOnly(t *testing.T) {
 	n := fakeNix(t)
 	f := fake.New()

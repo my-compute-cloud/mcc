@@ -272,7 +272,7 @@ type Stop struct {
 	Reason       string `json:"reason,omitempty"`
 }
 
-// Attach: A caller wants a task's output relayed. The control plane passes this on and understands none of it but the ids: client_key and salt agree an encryption key with the host, and auth is the task's secret sealed under that key.
+// Attach: A caller wants a task's output relayed. The control plane passes this on and understands none of it but the ids: client_key and salt agree a secret with the host, and auth is the task's secret sealed under a key made from it, bound to the task, the offset and follow.
 type Attach struct {
 	Type string `json:"type"`
 	V    int    `json:"v"`
@@ -314,12 +314,10 @@ type Output struct {
 	Data string `json:"data,omitempty"`
 	// Nothing more follows
 	End bool `json:"end,omitempty"`
-	// With end: the task's exit code, if it ran to an exit. Absent means 0 unless code is set
-	ExitCode int `json:"exit_code,omitempty"`
-	// With end: why the task has no exit code; running if the stream ended before the task did
-	Code string `json:"code,omitempty"`
-	// With end: the task printed more than the host kept
-	Truncated bool `json:"truncated,omitempty"`
+	// In a stream's first frame, alone: random bytes from the host, base64, that this stream's key is made with
+	Nonce string `json:"nonce,omitempty"`
+	// With end: how the task ended (exit code, or why it has none, and whether output was truncated), sealed, base64
+	Summary string `json:"summary,omitempty"`
 	// The stream could not be started, or broke
 	Error string `json:"error,omitempty"`
 }

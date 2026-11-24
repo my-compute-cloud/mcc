@@ -303,3 +303,35 @@ func (p *pipe) expect(t *testing.T, want string) {
 		}
 	}
 }
+
+func TestARunsOutputCannotBeTakenOverByAnotherWithItsID(t *testing.T) {
+	s := New(t.TempDir(), Limits{})
+	l, err := s.Create(Meta{ID: "t1", Cloud: "ours", Task: "build", SecretHash: hashOf("ours")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = l.Write([]byte("private\n"))
+	// While it runs, nobody starts another under its id, with a secret of their own.
+	for _, cloud := range []string{"ours", "theirs"} {
+		if _, err := s.Create(Meta{ID: "t1", Cloud: cloud, SecretHash: hashOf("theirs")}); err == nil {
+			t.Fatalf("a run still going was replaced by one from %s", cloud)
+		}
+	}
+	if m, _ := s.Meta("t1"); !m.Allows("ours") || m.Allows("theirs") {
+		t.Fatal("the run's secret changed")
+	}
+	l.Close(intp(0), "")
+	// Once it has ended, another cloud still cannot have its id; its own cloud may run it again.
+	if _, err := s.Create(Meta{ID: "t1", Cloud: "theirs"}); err == nil {
+		t.Fatal("another cloud replaced a run that had ended")
+	}
+	var b bytes.Buffer
+	if _, err := s.Copy(&b, "t1", 0, false, nil, nil); err != nil || b.String() != "private\n" {
+		t.Fatalf("the output is %q, %v", b.String(), err)
+	}
+	again, err := s.Create(Meta{ID: "t1", Cloud: "ours"})
+	if err != nil {
+		t.Fatalf("its own cloud could not run it again: %v", err)
+	}
+	again.Close(intp(0), "")
+}

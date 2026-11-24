@@ -43,8 +43,63 @@ func TestImageAllowed(t *testing.T) {
 			t.Errorf("%s: want %v", src, want)
 		}
 	}
-	if !(Policy{}).ImageAllowed("anything") {
+	if !(Policy{}).ImageAllowed("ghcr.io/anyone/anything:latest") {
 		t.Error("empty list allows")
+	}
+}
+
+func TestAnImageOnTheHostNeedsAPatternThatNamesIt(t *testing.T) {
+	for _, src := range []string{"my-own-vm", "/srv/images/ubuntu", "./images/ubuntu", "/ghcr.io/me/x", ""} {
+		if !LocalImage(src) {
+			t.Errorf("%q names something on the host", src)
+		}
+		if (Policy{}).ImageAllowed(src) {
+			t.Errorf("%q: allowed with no pattern", src)
+		}
+		if (Policy{AllowedImages: []string{"ghcr.io/me/*"}}).ImageAllowed(src) {
+			t.Errorf("%q: allowed by a pattern for a registry", src)
+		}
+	}
+	if LocalImage("ghcr.io/me/ubuntu:latest") || LocalImage("localhost:5000/ubuntu") {
+		t.Error("a registry reference was taken for something on the host")
+	}
+	p := Policy{AllowedImages: []string{"my-own-vm", "/srv/images/*"}, ExcludedImages: []string{"/srv/images/old"}}
+	for src, want := range map[string]bool{
+		"my-own-vm":                   true,
+		"my-other-vm":                 false,
+		"/srv/images/ubuntu":          true,
+		"/srv/images/old":             false,
+		"/srv/other/ubuntu":           false,
+		"/srv/images/../../etc":       false,
+		"/srv/images//ubuntu":         false,
+		"ghcr.io/me/ubuntu:latest":    false,
+		"/srv/images/ubuntu/../../..": false,
+	} {
+		if p.ImageAllowed(src) != want {
+			t.Errorf("%s: want %v", src, want)
+		}
+	}
+}
+
+func TestWhatTheAgentMadeOrAJobWroteIsNeverAnImage(t *testing.T) {
+	cache := t.TempDir()
+	elsewhere := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cache, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A way into the cache from outside it.
+	link := filepath.Join(elsewhere, "link")
+	if err := os.Symlink(filepath.Join(cache, "repo"), link); err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{AllowedImages: []string{"*", "/*", "mcc-*"}, CacheDir: cache}
+	for _, src := range []string{"mcc-a1", "mcc-base-0123456789ab", "MCC-a1", cache, filepath.Join(cache, "repo"), filepath.Join(cache, "not", "there"), link} {
+		if p.ImageAllowed(src) {
+			t.Errorf("%s: allowed", src)
+		}
+	}
+	if !p.ImageAllowed("my-own-vm") || !p.ImageAllowed(elsewhere) {
+		t.Error("the owner's own images were refused")
 	}
 }
 

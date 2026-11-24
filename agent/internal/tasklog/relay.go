@@ -28,17 +28,29 @@ import (
 // hosts no caller can reach. What passes through is sealed between the two ends:
 //
 //   - The caller makes a one-time P-256 key and agrees a secret with the host's output key
-//     (the one whose pin it was given), by Diffie-Hellman. From that and a salt of the
-//     caller's choosing both ends derive one AES-256-GCM key.
-//   - The caller sends the task's secret sealed under that key. The host opens it and checks
-//     it against the hash that came with the task, as the direct listener does.
-//   - The host sends the output in parts, each sealed under the same key.
+//     (the one whose pin it was given), by Diffie-Hellman.
+//   - The caller sends the task's secret sealed under a key made from that and a salt of its
+//     choosing, bound to what it asks for: the task, where to start, and whether to follow.
+//     The host opens it and checks it against the hash that came with the task, as the direct
+//     listener does.
+//   - The host answers with random bytes of its own. The output is sealed under a second key,
+//     made from the agreed secret, the salt and those bytes, so every stream has a key of its
+//     own. Were the key the same each time, a control plane that sent a caller's request
+//     again, to start elsewhere, would be given other output sealed exactly as the first was,
+//     which is enough to read both.
+//   - The host sends the output in parts, and then how the task ended, each sealed under that
+//     key. A stream that stops without its sealed ending was cut short.
 //
 // The control plane passes all of it on and holds neither the task's secret nor either
-// private key, so it can read none of it. As with the direct listener, that rests on the
-// caller having the right pin for the host.
+// private key, so it can read none of it, and cannot say how a task ended. As with the direct
+// listener, that rests on the caller having the right pin for the host.
 
-const relayInfo = "mcc-output-relay-v1"
+const (
+	relayAuthInfo  = "mcc-output-relay-v2 auth"
+	relayPartsInfo = "mcc-output-relay-v2 parts"
+	// The host's random bytes for one stream.
+	streamNonceSize = 32
+)
 
 // Directions, so that the two ends never seal under the same nonce.
 const (
@@ -51,8 +63,8 @@ type Channel struct {
 	aead cipher.AEAD
 }
 
-func newChannel(shared, salt []byte) (*Channel, error) {
-	key, err := hkdf.Key(sha256.New, shared, salt, relayInfo, 32)
+func newChannel(shared, salt []byte, info string) (*Channel, error) {
+	key, err := hkdf.Key(sha256.New, shared, salt, info, 32)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +105,27 @@ func (c *Channel) SealPart(n uint64, offset int64, part []byte) string {
 	return c.seal(fromHost, n, strconv.FormatInt(offset, 10), part)
 }
 
+// Summary is how a stream ended, as the host seals it: the task's exit code if it ran to one,
+// or why it has none ("running" if the stream ended before the task did).
+type Summary struct {
+	ExitCode  *int   `json:"exit_code,omitempty"`
+	Code      string `json:"code,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
+
+// SealEnd seals how a stream ended, after n parts that reached offset.
+func (c *Channel) SealEnd(n uint64, offset int64, s Summary) string {
+	plain, _ := json.Marshal(s)
+	return c.seal(fromHost, n, endAbout(offset), plain)
+}
+
+func endAbout(offset int64) string { return "end\n" + strconv.FormatInt(offset, 10) }
+
+// authAbout is what a caller's sealed secret is bound to: the request it was made for.
+func authAbout(taskID string, offset int64, follow bool) string {
+	return fmt.Sprintf("auth\n%s\n%d\n%t", taskID, offset, follow)
+}
+
 // PublicKey is a host's output key as callers are given it: base64 of its
 // SubjectPublicKeyInfo. Its pin is the SHA-256 of the same bytes.
 func PublicKey(key *ecdsa.PrivateKey) (string, error) {
@@ -103,43 +136,66 @@ func PublicKey(key *ecdsa.PrivateKey) (string, error) {
 	return base64.StdEncoding.EncodeToString(der), nil
 }
 
-// HostChannel is the host's end: from its own key, and what the caller sent to attach. It
-// returns the channel and the task's secret the caller sealed.
-func HostChannel(key *ecdsa.PrivateKey, clientKey, salt, auth string) (*Channel, string, error) {
+// HostChannel is the host's end: from its own key, what the caller sent to attach, and what
+// the caller asked for. It returns the channel that seals this stream, the random bytes the
+// caller needs to open it, and the task's secret the caller sealed.
+func HostChannel(key *ecdsa.PrivateKey, clientKey, salt, auth, taskID string, offset int64, follow bool) (ch *Channel, streamNonce, secret string, err error) {
 	priv, err := key.ECDH()
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	rawKey, err := base64.StdEncoding.DecodeString(clientKey)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	pub, err := ecdh.P256().NewPublicKey(rawKey)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	rawSalt, err := base64.StdEncoding.DecodeString(salt)
 	if err != nil || len(rawSalt) < 16 {
-		return nil, "", errors.New("the salt is too short")
+		return nil, "", "", errors.New("the salt is too short")
 	}
 	shared, err := priv.ECDH(pub)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	ch, err := newChannel(shared, rawSalt)
+	authCh, err := newChannel(shared, rawSalt, relayAuthInfo)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	secret, err := ch.open(fromCaller, 0, "auth", auth)
+	opened, err := authCh.open(fromCaller, 0, authAbout(taskID, offset, follow), auth)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	return ch, string(secret), nil
+	rawNonce := make([]byte, streamNonceSize)
+	if _, err := rand.Read(rawNonce); err != nil {
+		return nil, "", "", err
+	}
+	if ch, err = newChannel(shared, append(rawSalt, rawNonce...), relayPartsInfo); err != nil {
+		return nil, "", "", err
+	}
+	return ch, base64.StdEncoding.EncodeToString(rawNonce), string(opened), nil
+}
+
+// callerEnd is the caller's end before the host has answered: enough to make the stream's
+// channel once the host's random bytes arrive.
+type callerEnd struct {
+	shared, salt []byte
+}
+
+// channel is the channel of the stream the host began with these random bytes.
+func (e *callerEnd) channel(streamNonce string) (*Channel, error) {
+	raw, err := base64.StdEncoding.DecodeString(streamNonce)
+	if err != nil || len(raw) != streamNonceSize {
+		return nil, errors.New("the host did not begin the stream properly")
+	}
+	return newChannel(e.shared, append(append([]byte{}, e.salt...), raw...), relayPartsInfo)
 }
 
 // callerChannel is the caller's end: from the host's public key, which the caller has checked
-// against its pin. It returns the channel and what to send the host to attach.
-func callerChannel(hostKey, secret string) (ch *Channel, clientKey, salt, auth string, err error) {
+// against its pin, and what it asks for. It returns what to send the host to attach.
+func callerChannel(hostKey, secret, taskID string, offset int64, follow bool) (end *callerEnd, clientKey, salt, auth string, err error) {
 	der, err := base64.StdEncoding.DecodeString(hostKey)
 	if err != nil {
 		return nil, "", "", "", err
@@ -168,11 +224,12 @@ func callerChannel(hostKey, secret string) (ch *Channel, clientKey, salt, auth s
 	if err != nil {
 		return nil, "", "", "", err
 	}
-	if ch, err = newChannel(shared, rawSalt); err != nil {
+	authCh, err := newChannel(shared, rawSalt, relayAuthInfo)
+	if err != nil {
 		return nil, "", "", "", err
 	}
-	return ch, base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()), base64.StdEncoding.EncodeToString(rawSalt),
-		ch.seal(fromCaller, 0, "auth", []byte(secret)), nil
+	return &callerEnd{shared: shared, salt: rawSalt}, base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()),
+		base64.StdEncoding.EncodeToString(rawSalt), authCh.seal(fromCaller, 0, authAbout(taskID, offset, follow), []byte(secret)), nil
 }
 
 // keyMatchesPin reports whether a public key, as callers are given it, is the one a pin names.
@@ -245,7 +302,7 @@ func ReadRelay(ctx context.Context, client *http.Client, server, token, id, secr
 	if !keyMatchesPin(task.Output.Key, pin) {
 		return end, ErrWrongKey
 	}
-	ch, clientKey, salt, auth, err := callerChannel(task.Output.Key, secret)
+	caller, clientKey, salt, auth, err := callerChannel(task.Output.Key, secret, id, offset, follow)
 	if err != nil {
 		return end, err
 	}
@@ -267,6 +324,7 @@ func ReadRelay(ctx context.Context, client *http.Client, server, token, id, secr
 		return end, err
 	}
 
+	var ch *Channel
 	var n uint64
 	next := offset
 	for {
@@ -275,19 +333,28 @@ func ReadRelay(ctx context.Context, client *http.Client, server, token, id, secr
 			return end, fmt.Errorf("the stream broke after %d bytes: %w", end.Read, err)
 		}
 		var f struct {
-			Offset    int64  `json:"offset"`
-			Data      string `json:"data"`
-			End       bool   `json:"end"`
-			ExitCode  *int   `json:"exit_code"`
-			Code      string `json:"code"`
-			Truncated bool   `json:"truncated"`
-			Error     string `json:"error"`
+			Nonce   string `json:"nonce"`
+			Offset  int64  `json:"offset"`
+			Data    string `json:"data"`
+			End     bool   `json:"end"`
+			Summary string `json:"summary"`
+			Error   string `json:"error"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return end, err
 		}
 		if f.Error != "" {
 			return end, errors.New(f.Error)
+		}
+		if ch == nil {
+			// The host's first word is the random bytes this stream's key is made with.
+			if f.Nonce == "" || f.Data != "" || f.End {
+				return end, errors.New("the host did not begin the stream properly; its agent may be older than this mcc")
+			}
+			if ch, err = caller.channel(f.Nonce); err != nil {
+				return end, err
+			}
+			continue
 		}
 		if f.Data != "" {
 			// A part is accepted only where the last one ended, and only if it opens under the key:
@@ -307,17 +374,24 @@ func ReadRelay(ctx context.Context, client *http.Client, server, token, id, secr
 			end.Read += int64(len(part))
 		}
 		if f.End {
-			end.Truncated = f.Truncated
+			// How it ended is the host's to say, sealed after everything it sent: an ending that
+			// does not open here was not the host's, or came before all the parts did.
+			plain, err := ch.open(fromHost, n, endAbout(next), f.Summary)
+			var sum Summary
+			if err != nil || json.Unmarshal(plain, &sum) != nil {
+				return end, fmt.Errorf("the stream was cut short after %d bytes: its ending was not sealed by the host", end.Read)
+			}
+			end.Truncated = sum.Truncated
 			switch {
-			case f.Code == "running":
+			case sum.Code == "running":
 				end.Running = true
-			case f.Code != "":
-				end.Code = f.Code
+			case sum.Code != "":
+				end.Code = sum.Code
 			default:
 				zero := 0
 				end.ExitCode = &zero
-				if f.ExitCode != nil {
-					end.ExitCode = f.ExitCode
+				if sum.ExitCode != nil {
+					end.ExitCode = sum.ExitCode
 				}
 			}
 			return end, nil

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -77,7 +79,7 @@ func authLogin(args []string) error {
 	}
 	// Everything a person needs is on stderr, so that stdout stays empty for scripts.
 	fmt.Fprintf(os.Stderr, "To sign in, open this page and approve the code %s:\n\n  %s\n\n", login.UserCode, login.URLWithCode)
-	if !*noBrowser && os.Getenv("MCC_NO_BROWSER") == "" && openBrowser(login.URLWithCode) == nil {
+	if !*noBrowser && os.Getenv("MCC_NO_BROWSER") == "" && mayOpen(login.URLWithCode, *server) && openBrowser(login.URLWithCode) == nil {
 		fmt.Fprintln(os.Stderr, "It has been opened in your browser.")
 	}
 	fmt.Fprintf(os.Stderr, "Waiting for your answer (up to %d minutes)...\n", login.ExpiresIn/60)
@@ -94,6 +96,31 @@ func authLogin(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "Signed in as %s%s.\n", creds.User, what)
 	return nil
+}
+
+// mayOpen reports whether a page the server named is one to hand to the desktop, which opens
+// whatever it is given: a file, or another program's address. Only a web page over TLS is,
+// or one on this machine when the server itself is spoken to without TLS.
+func mayOpen(page, server string) bool {
+	u, err := url.Parse(page)
+	if err != nil || u.Hostname() == "" || u.User != nil {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	s, err := url.Parse(server)
+	return err == nil && u.Scheme == "http" && s.Scheme == "http" && loopback(u.Hostname())
+}
+
+// loopback reports whether a host name or address is this machine.
+func loopback(host string) bool {
+	host = strings.ToLower(host)
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // openBrowser asks the desktop to show a page. It fails where there is no desktop to ask.

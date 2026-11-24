@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -429,6 +430,38 @@ func TestJobsGetTheirRepositorysCache(t *testing.T) {
 	// A job whose repository cannot be told runs, without a cache.
 	if unknown := run("c4", "secret-jit"); len(unknown.SharedDirs) != 0 {
 		t.Fatalf("a job of unknown origin was given %+v", unknown.SharedDirs)
+	}
+}
+
+func TestARunnerConfigurationHoldsOnlyARunnersFiles(t *testing.T) {
+	runner := base64.StdEncoding.EncodeToString([]byte(`{"gitHubUrl":"https://github.com/acme/builds"}`))
+	jit := func(names ...string) string {
+		files := map[string]string{}
+		for _, n := range names {
+			files[n] = runner
+		}
+		b, _ := json.Marshal(files)
+		return base64.StdEncoding.EncodeToString(b)
+	}
+	if _, err := jitRunner(jit(".runner", ".credentials", ".credentials_rsaparams")); err != nil {
+		t.Fatalf("a runner's own files were refused: %v", err)
+	}
+	for _, name := range []string{"../../.ssh/authorized_keys", "/etc/cron.d/job", ".env", ".Runner", ""} {
+		if _, err := jitRunner(jit(".runner", name)); !errors.Is(err, errRunnerFiles) {
+			t.Fatalf("%q: %v", name, err)
+		}
+	}
+
+	// In a VM, whatever else the policy says.
+	cp, _, _ := startAgentWith(t, config.DefaultPolicy(), fake.New(), nil)
+	<-cp.hellos
+	cp.next(isType("capacity"))
+	m := startMsg("f1")
+	m["workload"].(map[string]any)["jit_config"] = jit(".runner", "../../.ssh/authorized_keys")
+	cp.send(m)
+	st := cp.next(status("f1", "failed"))
+	if st["code"] != "refused_policy" || !strings.Contains(st["reason"].(string), "names a file") {
+		t.Fatalf("got %v", st)
 	}
 }
 

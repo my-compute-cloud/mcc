@@ -549,6 +549,28 @@ func TestLocalImageDirectory(t *testing.T) {
 	}
 }
 
+func TestWhatTheExecutorKeepsIsNotAnImage(t *testing.T) {
+	k, _ := stubHost(t)
+	ctx := context.Background()
+	// A job's VM directory, made to look like an image.
+	dir := filepath.Join(k.Dir, "vms", "mcc-other")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "disk.qcow2"), []byte("another job's work"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"architecture":"arm64","os":"linux","user":"admin","uid":1000,"gid":1000}`), 0o644)
+	for _, src := range []string{dir, k.Dir, filepath.Join(k.Dir, "vms", "..", "vms", "mcc-other")} {
+		img := protocol.ImageSpec{Name: "theirs", Source: src, Platform: "linux"}
+		if err := k.Prepare(ctx, img); err == nil || !strings.Contains(err.Error(), "agent's own directory") {
+			t.Fatalf("%s: prepare: %v", src, err)
+		}
+		if err := k.Refresh(ctx, img); err == nil {
+			t.Fatalf("%s: refreshed", src)
+		}
+		if k.Ready(ctx, img) {
+			t.Fatalf("%s: ready", src)
+		}
+	}
+}
+
 func TestReadOnlyShareDiskIsMadeOncePerState(t *testing.T) {
 	k, logf := stubHost(t)
 	ctx := context.Background()

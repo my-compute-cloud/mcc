@@ -243,7 +243,7 @@
     "Attach": {
       "type": "object",
       "x-message": "attach",
-      "description": "A caller wants a task's output relayed. The control plane passes this on and understands none of it but the ids: client_key and salt agree an encryption key with the host, and auth is the task's secret sealed under that key.",
+      "description": "A caller wants a task's output relayed. The control plane passes this on and understands none of it but the ids: client_key and salt agree a secret with the host, and auth is the task's secret sealed under a key made from it, bound to the task, the offset and follow.",
       "properties": {
         "stream_id": { "type": "string", "description": "Names this stream in output and detach" },
         "task_id": { "type": "string" },
@@ -274,9 +274,8 @@
         "offset": { "type": "integer", "description": "Where this part starts in the output; absent means 0" },
         "data": { "type": "string", "description": "The part, sealed, base64" },
         "end": { "type": "boolean", "description": "Nothing more follows" },
-        "exit_code": { "type": "integer", "description": "With end: the task's exit code, if it ran to an exit. Absent means 0 unless code is set" },
-        "code": { "type": "string", "description": "With end: why the task has no exit code; running if the stream ended before the task did" },
-        "truncated": { "type": "boolean", "description": "With end: the task printed more than the host kept" },
+        "nonce": { "type": "string", "description": "In a stream's first frame, alone: random bytes from the host, base64, that this stream's key is made with" },
+        "summary": { "type": "string", "description": "With end: how the task ended (exit code, or why it has none, and whether output was truncated), sealed, base64" },
         "error": { "type": "string", "description": "The stream could not be started, or broke" }
       },
       "required": ["stream_id"]

@@ -226,6 +226,10 @@ type source struct {
 // one the owner built here, is used as it is.
 func (k *KVM) resolve(ctx context.Context, src string) (source, error) {
 	if filepath.IsAbs(src) {
+		// What the executor keeps is not an image: a job's VM there holds that job's work.
+		if rel, err := filepath.Rel(filepath.Clean(k.Dir), filepath.Clean(src)); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return source{}, fmt.Errorf("an image cannot be inside the agent's own directory")
+		}
 		r, err := localImage(src)
 		if err != nil {
 			return source{}, err

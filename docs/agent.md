@@ -279,7 +279,7 @@ ignored the report would only be refused.
 | Field | Default | Meaning |
 |---|---|---|
 | `max_vms` | 2 | Concurrent VMs of any kind. Of those, at most two can be macOS guests, which is Apple's rule; Linux guests are limited only by this number. |
-| `allowed_images` | any image of the account | Glob patterns on image sources, for example `ghcr.io/cirruslabs/*`. A trailing `*` matches the rest of the source. |
+| `allowed_images` | any image of the account | Glob patterns on image sources, for example `ghcr.io/cirruslabs/*`. A trailing `*` matches the rest of the source. A source that names something on the host itself, a Tart VM by its name or an image directory by its path, runs only when a pattern here matches it; the agent's own VMs (`mcc-…`) and anything under `cache_dir` are never images. |
 | `excluded_images` | none | Patterns of the same kind for images this host never runs, even ones `allowed_images` matches |
 | `allowed_github_urls` | any | Repository or organization URLs a runner may register with; read from the just-in-time config. An entry ending in `/*`, such as `https://github.com/you/*`, takes every repository of that account, and the account itself |
 | `cpus`, `memory_mb` | an equal share | Per VM. By default the host divided by `max_vms`, and never more than half. |
@@ -416,7 +416,8 @@ source the host is sent.
 
 A pool's image source may also be the full path of a directory on the host that holds
 `disk.qcow2` and `config.json`, which is what the build leaves: an image built on the host
-needs no registry.
+needs no registry. The host's policy must name such a path in `allowed_images`: with none
+listed, only images from a registry run.
 
 What an image must have: a user for jobs with `sudo` without a password, an SSH server, the
 `mcc-guest-access` service that the images repository installs (it lets in the key the host

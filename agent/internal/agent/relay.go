@@ -40,7 +40,7 @@ func (c *cloud) handleAttach(ctx context.Context, m protocol.Attach) {
 		refuse(relayRefused)
 		return
 	}
-	ch, secret, err := tasklog.HostChannel(key, m.ClientKey, m.Salt, m.Auth)
+	ch, streamNonce, secret, err := tasklog.HostChannel(key, m.ClientKey, m.Salt, m.Auth, m.TaskID, int64(m.Offset), m.Follow)
 	if err != nil {
 		refuse(relayRefused)
 		return
@@ -66,6 +66,8 @@ func (c *cloud) handleAttach(ctx context.Context, m protocol.Attach) {
 	c.streams.cancel[m.StreamID] = cancel
 	c.streams.mu.Unlock()
 
+	// First, what the caller needs to open this stream and no other.
+	c.send(&protocol.Output{Type: protocol.TypeOutput, StreamID: m.StreamID, Nonce: streamNonce})
 	go func() {
 		defer func() {
 			cancel()
@@ -82,14 +84,13 @@ func (c *cloud) handleAttach(ctx context.Context, m protocol.Attach) {
 			refuse("reading the output failed")
 			return
 		}
-		out := &protocol.Output{Type: protocol.TypeOutput, StreamID: m.StreamID, End: true, Truncated: end.Truncated, Code: end.Code}
-		switch {
-		case end.Running():
-			out.Code = "running"
-		case end.ExitCode != nil:
-			out.ExitCode = *end.ExitCode
+		// How it ended is sealed too: the control plane cannot give a task another exit code,
+		// or end the stream early and have it pass for the whole output.
+		sum := tasklog.Summary{Truncated: end.Truncated, Code: end.Code, ExitCode: end.ExitCode}
+		if end.Running() {
+			sum = tasklog.Summary{Truncated: end.Truncated, Code: "running"}
 		}
-		c.send(out)
+		c.send(&protocol.Output{Type: protocol.TypeOutput, StreamID: m.StreamID, End: true, Summary: w.ch.SealEnd(w.n, w.offset, sum)})
 	}()
 }
 

@@ -156,6 +156,36 @@ func TestRefreshReplacesBase(t *testing.T) {
 	}
 }
 
+func TestTheAgentsOwnVMsAreNeverImages(t *testing.T) {
+	tt, logf := stubTart(t)
+	ctx := context.Background()
+	// Another job's VM, and the base of another image, both already on the host.
+	for _, name := range []string{"mcc-other", BaseName("ghcr.io/x:latest"), "MCC-other"} {
+		if _, err := tt.run(ctx, "clone", "anything", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = os.WriteFile(logf, nil, 0o644)
+	for _, name := range []string{"mcc-other", BaseName("ghcr.io/x:latest"), "MCC-other", "mcc-not-made-yet"} {
+		img := protocol.ImageSpec{Name: "theirs", Source: name}
+		if err := tt.Prepare(ctx, img); err == nil || !strings.Contains(err.Error(), "own VMs") {
+			t.Fatalf("%s: prepare: %v", name, err)
+		}
+		if err := tt.Refresh(ctx, img); err == nil {
+			t.Fatalf("%s: refreshed", name)
+		}
+		if tt.Ready(ctx, img) {
+			t.Fatalf("%s: ready", name)
+		}
+		if _, err := tt.Start(ctx, "a1", img, executor.StartOptions{}); err == nil {
+			t.Fatalf("%s: started", name)
+		}
+	}
+	if got := calls(t, logf); len(got) != 1 || got[0] != "" {
+		t.Fatalf("tart was asked for something: %q", got)
+	}
+}
+
 // The owner's own VMs live beside the agent's and may be named anything, including like a
 // job's. The agent cleans up what it made, by its own record, and nothing else.
 func TestOnlyVMsTheAgentMadeAreItsToDelete(t *testing.T) {

@@ -138,13 +138,24 @@ type Log struct {
 	changed chan struct{} // closed and replaced whenever there is more to read, or the run ends
 }
 
-// Create starts the record of a run. A second run with the same id replaces the first.
+// Create starts the record of a run. A run that has ended may be replaced by another with the
+// same id from the same cloud. One still running is not: its output would go on being written
+// where the newcomer, with a secret of its own, could read it. Nor is another cloud's.
 func (s *Store) Create(m Meta) (*Log, error) {
 	if !idPattern.MatchString(m.ID) {
 		return nil, fmt.Errorf("task id %q cannot name a file", m.ID)
 	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return nil, err
+	}
+	// Held throughout, so that two runs with one id cannot both find it free.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live[m.ID] != nil {
+		return nil, fmt.Errorf("task id %q is that of a run still going", m.ID)
+	}
+	if old, err := s.readMeta(m.ID); err == nil && old.Cloud != m.Cloud {
+		return nil, fmt.Errorf("task id %q is that of another cloud's run", m.ID)
 	}
 	m.Started, m.Ended, m.ExitCode, m.Code, m.Truncated = s.Now(), nil, nil, "", false
 	f, err := os.OpenFile(s.logPath(m.ID), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -156,9 +167,7 @@ func (s *Store) Create(m Meta) (*Log, error) {
 		return nil, err
 	}
 	l := &Log{s: s, meta: m, f: f, changed: make(chan struct{})}
-	s.mu.Lock()
 	s.live[m.ID] = l
-	s.mu.Unlock()
 	return l, nil
 }
 
