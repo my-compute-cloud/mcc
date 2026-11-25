@@ -130,7 +130,8 @@ func (n *HostNix) Snapshot(ctx context.Context, id string) (string, func(), erro
 // it can tell because a job marks each path it used that the cache already had.
 //
 // The settings are also left in MCC_NIX_CONFIG, for an image that has no Nix and a workflow
-// that installs it: adding them to /etc/nix/nix.conf after installing does the same.
+// that installs it: adding them to /etc/nix/nix.conf after installing (nix.custom.conf for
+// Determinate Nix) does the same.
 const nixSetup = `mcc_nix() {
   local conf="" subs=""
   hook=/etc/nix/mcc-built
@@ -205,20 +206,26 @@ fallback = true
   # Only an image that has Nix is set up here, and only where the job's user may: the
   # settings are the Nix daemon's, which reads them when it starts.
   [ -e /nix/var/nix/daemon-socket ] && sudo -n true 2>/dev/null || return 0
-  local t
+  local t f=/etc/nix/nix.conf
+  # Determinate Nix owns nix.conf and rewrites it; it reads added settings from
+  # nix.custom.conf, which its nix.conf includes.
+  if [ -x /usr/local/bin/determinate-nixd ] || command -v determinate-nixd >/dev/null 2>&1; then
+    f=/etc/nix/nix.custom.conf
+  fi
   t=$(mktemp)
   # The file may be a link into the store, as nix-darwin makes it; it is replaced by a copy
   # with the settings added.
-  cat /etc/nix/nix.conf > "$t" 2>/dev/null || true
+  cat "$f" > "$t" 2>/dev/null || true
   printf '\n%s' "$conf" >> "$t"
-  sudo rm -f /etc/nix/nix.conf
-  sudo install -m 0644 "$t" /etc/nix/nix.conf
+  sudo rm -f "$f"
+  sudo install -m 0644 "$t" "$f"
   rm -f "$t"
   if command -v launchctl >/dev/null 2>&1; then
-    sudo launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null ||
-      sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null || true
+    sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null ||
+      sudo launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null || true
   else
-    sudo systemctl restart nix-daemon 2>/dev/null || true
+    sudo systemctl restart nix-daemon 2>/dev/null ||
+      sudo systemctl restart determinate-nixd 2>/dev/null || true
   fi
   # The daemon takes a moment to listen again, and a job's first step may be a build.
   local ns=/nix/var/nix/profiles/default/bin/nix-store

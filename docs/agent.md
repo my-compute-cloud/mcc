@@ -525,8 +525,14 @@ entry command leaves the settings there, and a step can add them after installin
 ```yaml
 - run: |
     if [ -n "${MCC_NIX_CONFIG:-}" ]; then
-      printf '%s\n' "$MCC_NIX_CONFIG" | sudo tee -a /etc/nix/nix.conf
-      sudo launchctl kickstart -k system/org.nixos.nix-daemon
+      # Determinate Nix reads added settings from nix.custom.conf; upstream Nix from nix.conf.
+      if [ -x /usr/local/bin/determinate-nixd ]; then
+        printf '%s\n' "$MCC_NIX_CONFIG" | sudo tee -a /etc/nix/nix.custom.conf
+        sudo launchctl kickstart -k system/systems.determinate.nix-daemon
+      else
+        printf '%s\n' "$MCC_NIX_CONFIG" | sudo tee -a /etc/nix/nix.conf
+        sudo launchctl kickstart -k system/org.nixos.nix-daemon
+      fi
     fi
 ```
 
