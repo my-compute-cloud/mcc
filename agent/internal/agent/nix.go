@@ -153,36 +153,49 @@ NS=/nix/var/nix/profiles/default/bin/nix-store
 mkdir -p "\$C/nar" || exit 0
 [ -e "\$C/nix-cache-info" ] || printf 'StoreDir: /nix/store\n' > "\$C/nix-cache-info"
 # The signatures each path carries, one line a path: the path, padded with spaces to line
-# up, a tab, its signatures. Nix also lists there that it built a path itself ("ultimate")
-# or that the path is addressed by its content ("ca:..."), which are not signatures. They
-# are kept with the path, so that a later job can still tell which cache it came from, and
-# a tool that publishes what a job built can leave out what a public cache already has.
+# up, a tab, its signatures. They are kept with the path, so that a later job can still
+# tell which cache it came from, and a tool that publishes what a job built can leave out
+# what a public cache already has. Nix also lists there that it built a path itself
+# ("ultimate"), which is left out, and that the path is addressed by its content
+# ("ca:fixed:r:sha256:..." for a fetched source, such as the input of a flake), which is
+# not a signature but goes in the narinfo's own CA line. Without it, a job that takes the
+# path from this cache has it in its store as though it had been built, and a tool that
+# leaves fetched sources out of what it publishes cannot tell it is one.
 SIGS=\$("\${NS%-store}" --extra-experimental-features nix-command path-info --sigs \$OUT_PATHS 2>/dev/null) || true
 sigs_of() { printf '%s\n' "\$SIGS" | awk -F'\t' -v p="\$1" '{ k = \$1; sub(/ +\$/, "", k) } k == p { n = split(\$2, s, " "); for (i = 1; i <= n; i++) if (s[i] ~ /^[^:]+:[A-Za-z0-9+\/]+=*\$/ && s[i] !~ /^ca:/) print "Sig: " s[i]; exit }'; }
+ca_of() { printf '%s\n' "\$SIGS" | awk -F'\t' -v p="\$1" '{ k = \$1; sub(/ +\$/, "", k) } k == p { n = split(\$2, s, " "); for (i = 1; i <= n; i++) if (s[i] ~ /^ca:./) { print "CA: " substr(s[i], 4); exit } exit }'; }
 for p in \$OUT_PATHS; do
   b=\${p##*/}; h=\${b%%-*}
   # Already kept. It is marked as used, which is how the host knows not to delete it. One
-  # kept before signatures were is given them now.
+  # kept before signatures, or the CA line, were is given them now.
   if [ -e "\$C/\$h.narinfo" ]; then
     touch "\$C/\$h.narinfo"
-    if ! grep -q '^Sig: ' "\$C/\$h.narinfo"; then
-      sig=\$(sigs_of "\$p")
-      if [ -n "\$sig" ]; then
-        { cat "\$C/\$h.narinfo"; printf '%s\n' "\$sig"; } > "\$C/.\$h.\$\$" && mv "\$C/.\$h.\$\$" "\$C/\$h.narinfo"
-      fi
+    add=""
+    grep -q '^Sig: ' "\$C/\$h.narinfo" || add=\$(sigs_of "\$p")
+    if ! grep -q '^CA: ' "\$C/\$h.narinfo"; then
+      ca=\$(ca_of "\$p")
+      [ -n "\$ca" ] && add="\${add:+\$add
+}\$ca"
+    fi
+    if [ -n "\$add" ]; then
+      { cat "\$C/\$h.narinfo"; printf '%s\n' "\$add"; } > "\$C/.\$h.\$\$" && mv "\$C/.\$h.\$\$" "\$C/\$h.narinfo"
     fi
     continue
   fi
   hash=\$("\$NS" -q --hash "\$p") || continue
   size=\$("\$NS" -q --size "\$p") || continue
   refs=\$("\$NS" -q --references "\$p" | sed 's#.*/##' | tr '\n' ' ')
+  # The derivation that built it, by name, as a narinfo has it. A fetched source, or a path
+  # copied in, has none.
+  drv=\$("\$NS" -q --deriver "\$p" 2>/dev/null) || drv=""
+  case "\$drv" in /nix/store/*.drv) drv="Deriver: \${drv##*/}" ;; *) drv="" ;; esac
   # Written under another name and then renamed, so that a job reading the cache never
   # finds half a file.
   t="\$C/nar/.\$h.\$\$"
   if "\$NS" --dump "\$p" > "\$t" && mv "\$t" "\$C/nar/\$h.nar"; then
-    sig=\$(sigs_of "\$p")
+    extra=\$([ -z "\$drv" ] || printf '%s\n' "\$drv"; sigs_of "\$p"; ca_of "\$p")
     printf 'StorePath: %s\nURL: nar/%s.nar\nCompression: none\nNarHash: %s\nNarSize: %s\nReferences: %s\n%s' \
-      "\$p" "\$h" "\$hash" "\$size" "\$refs" "\${sig:+\$sig
+      "\$p" "\$h" "\$hash" "\$size" "\$refs" "\${extra:+\$extra
 }" > "\$C/.\$h.\$\$" && mv "\$C/.\$h.\$\$" "\$C/\$h.narinfo"
   else
     rm -f "\$t"

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -163,5 +164,106 @@ func TestAnImageAJobNamesIsFetchedWhenAsked(t *testing.T) {
 	cp.next(status("p2", "finished"))
 	if !f.Ready(ctx, tahoe) {
 		t.Fatal("the named image was not fetched for the job that asked")
+	}
+}
+
+// runPostBuildHook renders the hook the entry command writes to /etc/nix/mcc-built, with Nix
+// replaced by stubs in bin, and runs it for paths, keeping into cache.
+func runPostBuildHook(t *testing.T, cache, bin string, paths ...string) {
+	t.Helper()
+	start := strings.Index(nixSetup, "<<HOOK\n")
+	end := strings.Index(nixSetup, "\nHOOK\n")
+	if start < 0 || end < start {
+		t.Fatal("the hook is missing from the Nix setup")
+	}
+	render := exec.Command("bash", "-c", "cat <<HOOK\n"+nixSetup[start+len("<<HOOK\n"):end]+"\nHOOK\n")
+	render.Env = append(os.Environ(), "MCC_CACHE_DIR="+cache)
+	hook, err := render.Output()
+	if err != nil {
+		t.Fatalf("rendering the hook: %v", err)
+	}
+	h := regexp.MustCompile(`(?m)^NS=.*$`).ReplaceAllString(string(hook), "")
+	h = strings.Replace(h, "mkdir -p", "NS="+filepath.Join(bin, "nix-store")+"\nmkdir -p", 1)
+	f := filepath.Join(t.TempDir(), "hook")
+	if err := os.WriteFile(f, []byte(h), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", f)
+	cmd.Env = append(os.Environ(), "OUT_PATHS="+strings.Join(paths, " "))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the hook: %v: %s", err, out)
+	}
+}
+
+// nixStubs writes a nix and a nix-store that answer for two paths: a flake's source, which
+// was fetched and is addressed by its content, and a build output, which has a deriver.
+func nixStubs(t *testing.T) string {
+	t.Helper()
+	bin := t.TempDir()
+	stubs := map[string]string{
+		"nix": `#!/bin/sh
+for p in "$@"; do case "$p" in
+  */aaaa-source) printf '%s\tca:fixed:r:sha256:1xcm cache.nixos.org-1:c2ln\n' "$p" ;;
+  */bbbb-hello) printf '%s\tultimate mcc-1:aGVsbG8=\n' "$p" ;;
+esac; done
+`,
+		"nix-store": `#!/bin/sh
+case "$1 $2" in
+  "-q --hash") echo sha256:0000 ;;
+  "-q --size") echo 4 ;;
+  "-q --references") ;;
+  "-q --deriver") case "$3" in */bbbb-hello) echo /nix/store/cccc-hello.drv ;; *) echo unknown-deriver ;; esac ;;
+  "--dump "*) printf nar ;;
+esac
+`,
+	}
+	for name, s := range stubs {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(s), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return bin
+}
+
+// A fetched source keeps that it is addressed by its content, which a job that takes it
+// from the cache, and a tool publishing what the job built, go by. A built path names its
+// derivation.
+func TestTheCacheKeepsWhatAddressesAPathByItsContent(t *testing.T) {
+	cache, bin := t.TempDir(), nixStubs(t)
+	src, built := "/nix/store/aaaa-source", "/nix/store/bbbb-hello"
+	runPostBuildHook(t, cache, bin, src, built)
+
+	read := func(h string) string {
+		b, err := os.ReadFile(filepath.Join(cache, "nix", h+".narinfo"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	got := read("aaaa")
+	want := "StorePath: /nix/store/aaaa-source\nURL: nar/aaaa.nar\nCompression: none\nNarHash: sha256:0000\nNarSize: 4\nReferences: \n" +
+		"Sig: cache.nixos.org-1:c2ln\nCA: fixed:r:sha256:1xcm\n"
+	if got != want {
+		t.Fatalf("source narinfo:\n%s\nwant:\n%s", got, want)
+	}
+	got = read("bbbb")
+	if !strings.Contains(got, "\nDeriver: cccc-hello.drv\n") || !strings.Contains(got, "\nSig: mcc-1:aGVsbG8=\n") || strings.Contains(got, "CA:") || strings.Contains(got, "ultimate") {
+		t.Fatalf("built narinfo:\n%s", got)
+	}
+
+	// One kept before the CA line was gets it, once; one that is not addressed by its
+	// content gets none.
+	old := "StorePath: /nix/store/aaaa-source\nURL: nar/aaaa.nar\nCompression: none\nNarHash: sha256:0000\nNarSize: 4\nReferences: \nSig: cache.nixos.org-1:c2ln\n"
+	if err := os.WriteFile(filepath.Join(cache, "nix", "aaaa.narinfo"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	builtBefore := read("bbbb")
+	runPostBuildHook(t, cache, bin, src, built)
+	runPostBuildHook(t, cache, bin, src, built)
+	if got := read("aaaa"); got != old+"CA: fixed:r:sha256:1xcm\n" {
+		t.Fatalf("backfilled source narinfo:\n%s", got)
+	}
+	if got := read("bbbb"); got != builtBefore {
+		t.Fatalf("a built path's narinfo changed:\n%s", got)
 	}
 }
