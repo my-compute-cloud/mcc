@@ -75,6 +75,8 @@ type PoolConfig struct {
 	// ImageSpec.name. Absent for a pool whose work runs on the host itself
 	Image     string    `json:"image,omitempty"`
 	Isolation Isolation `json:"isolation,omitempty"`
+	// How many VMs of the pool's image this host is to keep booted and waiting, tied to no repository until a job is given one: its share of the pool's warm VMs, which the control plane divides among the pool's hosts. Absent or 0 for none; a host keeps no more than its free slots and its owner's warm_vms allow
+	WarmVms int `json:"warm_vms,omitempty"`
 }
 
 // HostPolicy: The policy a host is running under, as its owner set it: what the host accepts and how it runs it. The host enforces it whatever the control plane does; the control plane is told so that it does not send what would be refused, and so that the account can see it. Paths on the host and the commands of its tasks are not part of it.
@@ -109,6 +111,8 @@ type HostPolicy struct {
 	HostTasks bool `json:"host_tasks,omitempty"`
 	// How long running work may hold back a newer agent; 0 means as long as it takes
 	UpgradeWaitMinutes int `json:"upgrade_wait_minutes,omitempty"`
+	// The most VMs the host keeps booted and waiting for its pools, whatever they ask; 0 when its owner allows none or the host cannot keep any
+	WarmVms int `json:"warm_vms"`
 }
 
 // TaskParam: One parameter of a task. A list of these rather than an object, so that the generated types stay simple.
@@ -176,6 +180,8 @@ type Capacity struct {
 	SlotsFree  int    `json:"slots_free"`
 	// ImageSpec.name values ready locally
 	ImagesReady []string `json:"images_ready"`
+	// ImageSpec.name values this host has a VM booted and waiting for, which a job of that image starts in without waiting for a boot. Absent if none
+	ImagesWarm []string `json:"images_warm,omitempty"`
 	// False outside active hours or while draining
 	Accepting bool `json:"accepting"`
 	// Guest platforms this host can run. Absent from agents that only run macOS guests

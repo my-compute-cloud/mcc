@@ -55,6 +55,7 @@ type Tart struct {
 	Preload []string
 
 	mu      sync.Mutex
+	builds  map[string]int       // base -> how many times this agent has built it
 	running map[string]*exec.Cmd // VM name -> `tart run` process
 	made    map[string]bool      // job VMs this agent made, when there is no Dir to keep them in
 	prepMu  sync.Mutex           // serialises image pulls
@@ -67,7 +68,7 @@ func New(log *slog.Logger) *Tart {
 	if err != nil {
 		bin = "tart"
 	}
-	return &Tart{Bin: bin, Log: log, BootTimeout: 5 * time.Minute, running: map[string]*exec.Cmd{}, made: map[string]bool{}, built: map[string]string{}}
+	return &Tart{Bin: bin, Log: log, BootTimeout: 5 * time.Minute, running: map[string]*exec.Cmd{}, builds: map[string]int{}, made: map[string]bool{}, built: map[string]string{}}
 }
 
 // BaseName is the local VM an image is cloned to before jobs clone from it, when nothing is
@@ -297,6 +298,9 @@ func (t *Tart) build(ctx context.Context, image protocol.ImageSpec, base string)
 		return err
 	}
 	t.built[base] = t.digest(ctx, image.Source)
+	t.mu.Lock()
+	t.builds[base]++
+	t.mu.Unlock()
 	t.pruneBases(ctx, image.Source, base)
 	return nil
 }
@@ -560,6 +564,25 @@ func (t *Tart) NetworkIsolationAvailable() bool {
 
 // GuestPlatforms: Tart runs macOS and Linux guests on Apple Silicon.
 func (t *Tart) GuestPlatforms() []string { return []string{"darwin", "linux"} }
+
+// LateShares: a macOS guest sees at once what the host moves into or clones into a shared
+// directory after boot. That was checked on macOS 26 guests; Linux guests have not been, and
+// their shares are mounted by the agent, so they get theirs at boot as before.
+func (t *Tart) LateShares(image protocol.ImageSpec) bool {
+	return image.Platform == "darwin" || image.Platform == ""
+}
+
+// BaseVersion names the base a new VM of the image is cloned from, and how many times this
+// agent has rebuilt it, which a refresh does when the image has changed.
+func (t *Tart) BaseVersion(ctx context.Context, image protocol.ImageSpec) string {
+	base, err := t.base(ctx, image)
+	if err != nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return fmt.Sprintf("%s#%d", base, t.builds[base])
+}
 
 // MaxVMs: Apple's licence and the Virtualization framework allow two macOS guests per host.
 func (t *Tart) MaxVMs(image protocol.ImageSpec) int {

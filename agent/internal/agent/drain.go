@@ -29,6 +29,8 @@ func (a *Agent) Drain(reason string) {
 	if !already {
 		a.log.Info("draining: no new work is taken, and what is running goes on", "why", reason)
 		a.announce()
+		// No job will take a warm VM now.
+		a.refillWarm()
 	}
 }
 
@@ -45,6 +47,7 @@ func (a *Agent) Resume(reason string) {
 	}
 	if left == 0 {
 		a.log.Info("no longer draining")
+		a.refillWarm()
 		// Images that were asked for while draining were not started.
 		if ctx != nil {
 			for _, c := range a.clouds {

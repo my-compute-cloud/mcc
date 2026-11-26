@@ -472,6 +472,7 @@ func run(args []string) error {
 		OutputKey:     outputKey,
 		Log:           log,
 		Resources:     resources(policy),
+		SlotDir:       slotDir(dir, policy),
 	})
 	// The owner's way in: what the agent is doing, and `mcc drain`.
 	go func() {
@@ -758,4 +759,13 @@ func showPolicy(args []string) error {
 	}{p, config.CloudPolicyPath(dir, *cloud), resources(machine), p.NetworkIsolation() && ex.NetworkIsolationAvailable(), p.StayAwakeEnabled(), p.SharedRunnerEnabled()}, "", "  ")
 	fmt.Println(string(b))
 	return nil
+}
+
+// slotDir is where the slots of VMs booted before their job are kept: beside the job caches,
+// since a slot is given a clone of one and a clone cannot leave its volume.
+func slotDir(dir string, policy config.Policy) string {
+	if policy.CacheDir != "" {
+		return filepath.Join(policy.CacheDir, "slots")
+	}
+	return filepath.Join(dir, "slots")
 }

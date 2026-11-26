@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -245,6 +246,8 @@ type poolHostView struct {
 	Connected bool   `json:"connected"`
 	Ready     bool   `json:"ready"`
 	NotReady  string `json:"not_ready"`
+	// WarmVMs is this host's share of the pool's warm VMs.
+	WarmVMs int `json:"warm_vms"`
 }
 
 type poolView struct {
@@ -254,7 +257,10 @@ type poolView struct {
 	// Also lists what a workflow may add to runs-on to choose among the pool's hosts.
 	Also      []string `json:"also"`
 	Isolation string   `json:"isolation"`
-	Image     *struct {
+	// WarmVMs is how many VMs of its image its hosts keep booted and waiting, in all. The
+	// control plane divides them among the hosts.
+	WarmVMs int `json:"warm_vms"`
+	Image   *struct {
 		Name   string `json:"name"`
 		Source string `json:"source"`
 	} `json:"image"`
@@ -268,14 +274,18 @@ func (p poolView) runs() string {
 	if p.Isolation == "host" {
 		return "on the host itself"
 	}
+	runs := "VMs"
 	if p.Image != nil {
-		return "VMs from " + p.Image.Name
+		runs = "VMs from " + p.Image.Name
 	}
-	return "VMs"
+	if p.WarmVMs > 0 {
+		runs += fmt.Sprintf(", %d warm in the pool", p.WarmVMs)
+	}
+	return runs
 }
 
 func pool(args []string) error {
-	const usage = "mcc pool list | show POOL | create NAME --label LABEL (--image IMAGE | --isolation host) | rename POOL NAME | set-image POOL IMAGE | add-host POOL HOST | remove-host POOL HOST | clear-flag POOL | rm POOL"
+	const usage = "mcc pool list | show POOL | create NAME --label LABEL (--image IMAGE [--warm N] | --isolation host) | rename POOL NAME | set-image POOL IMAGE | set-warm POOL N | add-host POOL HOST | remove-host POOL HOST | clear-flag POOL | rm POOL"
 	if len(args) == 0 {
 		return errors.New("usage: " + usage)
 	}
@@ -283,6 +293,7 @@ func pool(args []string) error {
 	label := fs.String("label", "", "what workflows say in runs-on to use this pool")
 	img := fs.String("image", "", "the image its VMs boot from")
 	isolation := fs.String("isolation", "vm", "vm, or host to run its work on the host itself with no VM")
+	warm := fs.Int("warm", 0, "how many VMs of its image its hosts keep booted and waiting in all, so a job need not wait for a boot")
 	k, cancel, err := start(fs, args[1:])
 	if err != nil {
 		return err
@@ -317,11 +328,15 @@ func pool(args []string) error {
 		return nil
 	case "create":
 		if len(k.args) != 1 || *label == "" || (*isolation != "host" && *img == "") {
-			return errors.New("usage: mcc pool create NAME --label LABEL (--image IMAGE | --isolation host)")
+			return errors.New("usage: mcc pool create NAME --label LABEL (--image IMAGE [--warm N] | --isolation host)")
 		}
 		body := map[string]any{"name": k.args[0], "label": *label, "isolation": *isolation}
 		if *isolation != "host" {
 			body["image_id"] = *img
+		}
+		// Sent only when asked for, so that the control plane says why a host pool cannot have it.
+		if *warm != 0 {
+			body["warm_vms"] = *warm
 		}
 		if err := k.send(http.MethodPost, "/api/v1/pools", body, nil); err != nil {
 			return err
@@ -343,6 +358,21 @@ func pool(args []string) error {
 			return err
 		}
 		return done("Pool %s now uses image %s.", k.args[0], k.args[1])
+	case "set-warm":
+		if err := k.need(2, "mcc pool set-warm POOL N"); err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(k.args[1])
+		if err != nil {
+			return fmt.Errorf("the number of warm VMs must be a whole number, not %q", k.args[1])
+		}
+		if err := k.send(http.MethodPut, "/api/v1/pools/"+seg(k.args[0])+"/warm", map[string]int{"warm_vms": n}, nil); err != nil {
+			return err
+		}
+		if n == 0 {
+			return done("Pool %s keeps no VMs warm. Its hosts stop the ones waiting now.", k.args[0])
+		}
+		return done("Pool %s keeps %d VM%s of its image booted and waiting, divided among its hosts as their owners allow.", k.args[0], n, yes(n == 1, "", "s"))
 	case "add-host", "remove-host":
 		if err := k.need(2, "mcc pool "+args[0]+" POOL HOST"); err != nil {
 			return err
@@ -419,8 +449,11 @@ type hostView struct {
 	HostSlots   slots      `json:"host_slots"`
 	Pools       []string   `json:"pools"`
 	ImagesReady []string   `json:"images_ready"`
-	Tasks       []string   `json:"tasks"`
-	Scripts     bool       `json:"scripts"`
+	ImagesWarm  []string   `json:"images_warm"`
+	// WarmVMs is the most warm VMs its owner lets it keep, over all its pools.
+	WarmVMs int      `json:"warm_vms"`
+	Tasks   []string `json:"tasks"`
+	Scripts bool     `json:"scripts"`
 	// Policy is what the host said it runs under when its agent last connected. Nil from an
 	// agent that does not say.
 	Policy *protocol.HostPolicy `json:"policy"`
@@ -503,6 +536,18 @@ func host(args []string) error {
 			fmt.Printf("  On the host   %s\n", yes(h.HostSlots.Total > 0, fmt.Sprintf("%d free of %d", h.HostSlots.Free, h.HostSlots.Total), "not allowed by its policy"))
 			fmt.Printf("  Pools         %s\n", or(strings.Join(h.Pools, ", "), "none"))
 			fmt.Printf("  Images ready  %s\n", or(strings.Join(h.ImagesReady, ", "), "none"))
+			warm := "none allowed by its policy"
+			if h.WarmVMs > 0 {
+				warm = fmt.Sprintf("up to %d; waiting now: %s", h.WarmVMs, or(strings.Join(h.ImagesWarm, ", "), "none"))
+			}
+			fmt.Printf("  Warm VMs      %s\n", warm)
+			for _, p := range st.Pools {
+				for _, ph := range p.Hosts {
+					if ph.ID == h.ID && ph.WarmVMs > 0 {
+						fmt.Printf("    %d for pool %s\n", ph.WarmVMs, p.Name)
+					}
+				}
+			}
 			fmt.Printf("  Tasks         %s\n", or(strings.Join(h.Tasks, ", "), "none declared"))
 			fmt.Printf("  Scripts       %s\n", yes(h.Scripts, "allowed in its VMs", "not allowed"))
 			if h.Policy == nil {

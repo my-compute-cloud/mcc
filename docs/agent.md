@@ -296,6 +296,7 @@ ignored the report would only be refused.
 | `cache_scope` | `runner` | Who shares a cache: `runner` or `host` |
 | `cache_max_gb` | no limit | Above this, the least recently used caches are deleted |
 | `share_nix_store` | `false` | Share this host's Nix store with each job's VM, read-only; see [Nix](#nix) |
+| `warm_vms` | `max_vms` | The most VMs this host keeps booted and waiting for its pools; 0 for none. See [Warm VMs](#warm-vms). Mac hosts only. |
 | `host_tasks` | off | Lets work run on the host itself, without a VM; see [below](#jobs-on-the-host-itself) |
 | `tasks` | none | Commands the control plane may ask this host to run, by name; see [below](#tasks) |
 | `allowed_workloads` | `["github-runner"]` | The kinds of work this host takes. Add `"script"` to let callers run their own shell scripts in its VMs; see [below](#scripts-in-vms) |
@@ -469,6 +470,13 @@ This is the one way a job can leave something for a later job, so decide who sha
 Within a scope, any job can write what a later job reads, including a job for a pull request
 from a fork. Leave `cache_dir` unset on hosts that run code from people you do not trust.
 
+On a Mac a job is given a clone of its cache, not the cache itself, so that a VM can be booted
+before anyone knows whose job it will run (see [Warm VMs](#warm-vms)). The clone takes no time
+and no room on the disk, whatever the cache's size. When the job ends, what it added or changed
+is put back into the cache. What it deleted is not deleted: another job of the same repository
+may be running with its own copy. Two jobs at once no longer see what the other writes until it
+has ended.
+
 Caches are plain directories under `cache_dir/data`; deleting one only costs the next job its
 downloads. With `cache_max_gb`, the agent deletes whole caches, least recently used first, when
 the total passes the limit, and never one a running job is using.
@@ -482,7 +490,7 @@ as ours, and need nothing in the workflow.
 **The job's cache keeps what jobs use.** With `cache_dir` set, Nix in the VM writes each
 thing it builds into `nix/` in the job's cache as soon as it is built, and takes from there
 what an earlier job of the same repository had. A job that fails late still leaves what it
-finished. When a job ends, everything else it added to its store is written there too: the
+finished. On a Mac that is the job's clone of the cache, which is put back when the job ends. When a job ends, everything else it added to its store is written there too: the
 sources it fetched, and what it copied from the host's store or downloaded. A job whose VM
 is stopped before it ends leaves only what it built.
 
@@ -535,6 +543,37 @@ entry command leaves the settings there, and a step can add them after installin
       fi
     fi
 ```
+
+## Warm VMs
+
+Booting a VM takes about fifteen seconds of each job's time, and copying the runner into it
+about five more. A pool can have VMs booted and waiting instead: `mcc pool set-warm POOL N`
+(see [operations.md](operations.md)) asks for N in the pool as a whole, and the control plane
+shares them out among the pool's hosts, at most as many on each as its owner's `warm_vms`
+allows. A pool of two hosts asking for one, where one host allows one and the other
+`"warm_vms": 0`, keeps one on the first. A job given to a host with one starts in it at once,
+and the control plane gives jobs to hosts with a warm VM of their image first.
+
+A warm VM is tied to no repository. Everything a job of any repository would get is given when
+it boots: the runner, copied into the guest at once, and the host's Nix store with
+`share_nix_store`. It is also given an empty directory of its own on the host, its slot, which
+it can write. When a job arrives, the runner is registered for the job's repository then, as
+for any VM, and the agent puts what is the job's alone into the slot: a clone of the job's cache
+and a copy of the host's Nix database. The guest sees them at once. A VM booted for a job that
+found no warm VM gets the same slot, filled as soon as it has booted.
+
+- **Each waiting VM holds one of `max_vms`, and its memory.** Apple allows two macOS VMs at
+  once whatever they are doing. A job that needs a VM when every one is a warm VM it cannot
+  use (another image, say) has one of them stopped to make room, which costs it a few seconds.
+- **When it is taken, another is booted** once there is room again: when a job ends.
+- **None are kept** while the host drains, outside its active hours, or when its owner sets
+  `"warm_vms": 0`. A host enrolled in several clouds keeps no more than `warm_vms` for all of
+  them together. One booted from an image that has since been refreshed, or with a runner
+  that has since been replaced, is stopped and booted again.
+- **Mac hosts only, and macOS guests only.** A Linux guest is given its shares when it boots, as
+  before: that its guests see a slot filled later has not been checked.
+- Slots are kept in `cache_dir/slots`, beside the caches they are given clones of: a clone
+  cannot leave its volume. Without `cache_dir`, in the agent's state directory.
 
 ## Jobs on the host itself
 
@@ -822,7 +861,8 @@ shared networking unless `require_network_isolation` is set.
 
 1. The image's base VM (`mcc-base-<hash>`, with a suffix when the host adds Xcode or container
    images to it) is cloned once per image; each job clones it to
-   `mcc-<assignment id>` (copy-on-write on APFS). The agent writes down each job VM it makes,
+   `mcc-<assignment id>` (copy-on-write on APFS), or a warm VM was cloned to `mcc-warm-<id>`
+   before the job arrived. The agent writes down each job VM it makes,
    in `tart/jobs` in its state directory, and stops or deletes only those. Your own VMs are
    left alone whatever they are called, and after a crash it cleans up by that record, not by
    name.
@@ -830,13 +870,15 @@ shared networking unless `require_network_isolation` is set.
    include the guest agent, which our images (`ghcr.io/my-compute-cloud/macos-runner`) and all
    non-vanilla Cirrus Labs images do. No SSH is used. A job's `PATH` and environment are the
    guest agent's, because the entry command's shell reads no profile.
-3. The fixed entry command (one for macOS guests, one for Linux, which first mounts the
-   host's shares) copies the shared runner into the guest (or uses `~/actions-runner`
-   from the image), reads `/etc/mcc/job-env` if the image has one, and runs
-   `run.sh --jitconfig`, with the configuration on stdin so it never appears in the host's
-   process list.
+3. A macOS guest's slot is filled for the job: a clone of its cache, and a copy of the host's
+   Nix database. The fixed entry command (one for macOS guests, one for Linux, which first
+   mounts the host's shares) copies the shared runner into the guest unless that was done
+   while the VM waited (or uses `~/actions-runner` from the image), reads `/etc/mcc/job-env`
+   if the image has one, and runs `run.sh --jitconfig`, with the configuration on stdin so it
+   never appears in the host's process list.
 4. When the runner exits, or the control plane sends `stop`, or the runner has not taken a job
-   within the idle timeout, the VM is stopped and deleted, and only then is the final status sent.
+   within the idle timeout, the VM is stopped and deleted. What the job added to its clone of
+   the cache is put back, the slot is deleted, and only then is the final status sent.
 5. On start-up the agent deletes any `mcc-*` job VMs left from a crash.
 
 On a Linux host the steps are the same with other means:

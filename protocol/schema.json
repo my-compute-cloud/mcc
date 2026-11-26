@@ -56,7 +56,8 @@
         "name": { "type": "string" },
         "label": { "type": "string" },
         "image": { "type": "string", "description": "ImageSpec.name. Absent for a pool whose work runs on the host itself" },
-        "isolation": { "$ref": "#/$defs/Isolation" }
+        "isolation": { "$ref": "#/$defs/Isolation" },
+        "warm_vms": { "type": "integer", "description": "How many VMs of the pool's image this host is to keep booted and waiting, tied to no repository until a job is given one: its share of the pool's warm VMs, which the control plane divides among the pool's hosts. Absent or 0 for none; a host keeps no more than its free slots and its owner's warm_vms allow" }
       },
       "required": ["name", "label"]
     },
@@ -81,9 +82,10 @@
         "cache_max_gb": { "type": "integer" },
         "share_nix_store": { "type": "boolean" },
         "host_tasks": { "type": "boolean", "description": "Whether work may run on the host itself" },
-        "upgrade_wait_minutes": { "type": "integer", "description": "How long running work may hold back a newer agent; 0 means as long as it takes" }
+        "upgrade_wait_minutes": { "type": "integer", "description": "How long running work may hold back a newer agent; 0 means as long as it takes" },
+        "warm_vms": { "type": "integer", "description": "The most VMs the host keeps booted and waiting for its pools, whatever they ask; 0 when its owner allows none or the host cannot keep any" }
       },
-      "required": ["max_vms"]
+      "required": ["max_vms", "warm_vms"]
     },
     "TaskParam": {
       "type": "object",
@@ -145,6 +147,7 @@
         "slots_total": { "type": "integer" },
         "slots_free": { "type": "integer" },
         "images_ready": { "type": "array", "items": { "type": "string" }, "description": "ImageSpec.name values ready locally" },
+        "images_warm": { "type": "array", "items": { "type": "string" }, "description": "ImageSpec.name values this host has a VM booted and waiting for, which a job of that image starts in without waiting for a boot. Absent if none" },
         "accepting": { "type": "boolean", "description": "False outside active hours or while draining" },
         "guests": {
           "type": "array",

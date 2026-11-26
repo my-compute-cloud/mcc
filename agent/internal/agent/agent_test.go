@@ -143,6 +143,12 @@ func startAgentWith(t *testing.T, policy config.Policy, f *fake.Fake, cacheSourc
 }
 
 func startAgentOpts(t *testing.T, policy config.Policy, f *fake.Fake, set func(*Options)) (*controlPlane, context.CancelFunc, chan struct{}) {
+	cp, cancel, done, _ := startTheAgent(t, policy, f, set)
+	return cp, cancel, done
+}
+
+// startTheAgent is startAgentOpts, and the agent too.
+func startTheAgent(t *testing.T, policy config.Policy, f *fake.Fake, set func(*Options)) (*controlPlane, context.CancelFunc, chan struct{}, *Agent) {
 	id := identity.FromSeed(make([]byte, 32))
 	cp := newControlPlane(t, id)
 	o := Options{
@@ -162,7 +168,7 @@ func startAgentOpts(t *testing.T, policy config.Policy, f *fake.Fake, set func(*
 		cancel()
 		<-done
 	})
-	return cp, cancel, done
+	return cp, cancel, done, a
 }
 
 func startMsg(id string) map[string]any {

@@ -92,3 +92,18 @@ type Executor interface {
 	// GuestPlatforms are the ImageSpec platforms this executor can run on this host.
 	GuestPlatforms() []string
 }
+
+// LateShares is an executor whose guests see what the host puts in a shared directory after
+// the machine has booted. Shares are fixed when a machine boots, so on such an executor a
+// machine can be booted before anyone knows whose work it will run, given an empty directory
+// to share, and handed what one job needs only once there is a job: its cache, and what else
+// the agent fills in for it.
+type LateShares interface {
+	LateShares(image protocol.ImageSpec) bool
+}
+
+// BaseVersions is an executor that can say which version of an image a new machine would be
+// made from. A machine booted from an older version is not given work once there is a newer.
+type BaseVersions interface {
+	BaseVersion(ctx context.Context, image protocol.ImageSpec) string
+}

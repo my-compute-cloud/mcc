@@ -38,29 +38,67 @@ const runnerShare = "mcc-runner"
 // cacheShare is the share name of the job's cache directory, when the owner provides one.
 const cacheShare = "mcc-cache"
 
+// slotShare is the share name of a VM's slot: an empty directory the VM is booted with, which
+// the agent fills for the job once it has one (warm.go). In it, slotCache is the job's cache
+// and slotNixState the copy of the host's Nix database.
+const (
+	slotShare    = "mcc-slot"
+	slotCache    = "cache"
+	slotNixState = "nix-state"
+)
+
+// runnerCopied marks a runner already copied into the guest, by warmUpScript.
+const runnerCopied = ".mcc-copied"
+
+// copyRunner copies the shared runner into the guest, where it can write beside itself as it
+// must. It is done without extended attributes (-X): the share cannot give those of a symbolic
+// link, and cp fails on each one it cannot copy. The runner needs none of them.
+const copyRunner = `    rm -rf "$RUNNER.mcc"
+    cp -RX "$SHARED" "$RUNNER.mcc"
+`
+
+// warmUpScript readies a macOS VM booted before its job: the runner is copied in now, which
+// otherwise takes seconds of the job's time.
+const warmUpScript = `set -euo pipefail
+SHARED="/Volumes/My Shared Files/` + runnerShare + `"
+RUNNER="$HOME/actions-runner"
+if [ -x "$SHARED/run.sh" ]; then
+` + copyRunner + `  touch "$RUNNER.mcc/` + runnerCopied + `"
+fi
+`
+
 // githubRunnerScript is the fixed entry command for the github-runner workload. The JIT
 // configuration arrives on stdin so it never appears in a process list on the host.
 const githubRunnerScript = `set -euo pipefail
 IFS= read -r JIT
-SHARED="/Volumes/My Shared Files/` + runnerShare + `"
+SHARES="/Volumes/My Shared Files"
+SHARES_URL="/Volumes/My%20Shared%20Files"
+SHARED="$SHARES/` + runnerShare + `"
 RUNNER="$HOME/actions-runner"
 if [ -x "$SHARED/run.sh" ]; then
-  rm -rf "$RUNNER.mcc"
-  # Without extended attributes (-X): the share cannot give those of a symbolic link, and
-  # cp fails on each one it cannot copy. The runner needs none of them.
-  cp -RX "$SHARED" "$RUNNER.mcc"
+  # A VM booted before its job has had the runner copied in already (warmUpScript).
+  if [ ! -e "$RUNNER.mcc/` + runnerCopied + `" ]; then
+` + copyRunner + `  fi
   RUNNER="$RUNNER.mcc"
 fi
 # The owner's cache for this job, if any, and the image's own say on what to do with it:
-# an image may set up the job's environment in /etc/mcc/job-env.
+# an image may set up the job's environment in /etc/mcc/job-env. A VM booted before its job
+# arrived finds the cache, and the copy of the host's Nix database, in its slot (warm.go);
+# any other VM has a share of each.
 # The cache is reached through a link without spaces in its path, which some build tools
 # cannot handle.
-if [ -d "/Volumes/My Shared Files/` + cacheShare + `" ]; then
-  ln -sfn "/Volumes/My Shared Files/` + cacheShare + `" "$HOME/.mcc-cache"
+CACHE="$SHARES/` + cacheShare + `"
+NIX_STATE="$SHARES/` + nixStateShare + `"
+NIX_STATE_URL="$SHARES_URL/` + nixStateShare + `"
+if [ -d "$SHARES/` + slotShare + `" ]; then
+  CACHE="$SHARES/` + slotShare + `/` + slotCache + `"
+  NIX_STATE="$SHARES/` + slotShare + `/` + slotNixState + `"
+  NIX_STATE_URL="$SHARES_URL/` + slotShare + `/` + slotNixState + `"
+fi
+if [ -d "$CACHE" ]; then
+  ln -sfn "$CACHE" "$HOME/.mcc-cache"
   export MCC_CACHE_DIR="$HOME/.mcc-cache"
 fi
-SHARES="/Volumes/My Shared Files"
-SHARES_URL="/Volumes/My%20Shared%20Files"
 ` + nixSetup + `if [ -r /etc/mcc/job-env ]; then
   . /etc/mcc/job-env
 fi
@@ -87,6 +125,8 @@ if [ -d "$SHARES/` + cacheShare + `" ]; then
   export MCC_CACHE_DIR="$HOME/.mcc-cache"
 fi
 SHARES_URL="$SHARES"
+NIX_STATE="$SHARES/` + nixStateShare + `"
+NIX_STATE_URL="$SHARES_URL/` + nixStateShare + `"
 ` + nixSetup + `if [ -r /etc/mcc/job-env ]; then
   . /etc/mcc/job-env
 fi
@@ -581,6 +621,10 @@ func (c *cloud) runAssignment(ctx context.Context, as *assignment, m protocol.St
 		ok, reason = c.execute(ctx, as, m, lg)
 	}
 	c.finish(as, lg, ok, reason)
+	if !as.host {
+		// Its VM is gone, and a warm one may take its place.
+		c.a.refillWarm()
+	}
 }
 
 // executeOnHost runs a runner on the host itself: in a directory made for it, holding a copy
@@ -646,13 +690,16 @@ func (c *cloud) execute(ctx context.Context, as *assignment, m protocol.Start, l
 		c.mu.Unlock()
 	}
 
+	// A script is not a GitHub job: it gets no runner and no job cache, only the VM.
+	runner := m.Workload.Kind == workloadGitHubRunner
+	if runner && c.usesSlot(m.Image) {
+		return c.executeInSlot(ctx, as, m, lg)
+	}
 	opts := executor.StartOptions{
 		Resources:      c.o.Resources,
 		IsolateNetwork: c.o.Policy.NetworkIsolation() && c.isolationOK,
 	}
 	opts.SharedDirs = map[string]executor.SharedDir{}
-	// A script is not a GitHub job: it gets no runner and no job cache, only the VM.
-	runner := m.Workload.Kind == workloadGitHubRunner
 	if runner && c.o.Policy.SharedRunnerEnabled() && c.o.Runner != nil {
 		if dir := c.o.Runner.Current(guestPlatform(m.Image)); dir != "" {
 			opts.SharedDirs[runnerShare] = executor.SharedDir{Path: dir}

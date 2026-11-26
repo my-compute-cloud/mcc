@@ -75,17 +75,26 @@ func (n *HostNix) Snapshot(ctx context.Context, id string) (string, func(), erro
 		return "", nil, fmt.Errorf("id %q cannot name a directory", id)
 	}
 	dir := filepath.Join(n.Work, id)
+	if err := n.SnapshotInto(ctx, dir); err != nil {
+		return "", nil, err
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
+}
+
+// SnapshotInto makes the same state directory at dir, which the caller removes: for a VM
+// that was booted before its job arrived, in the directory shared into it then.
+func (n *HostNix) SnapshotInto(ctx context.Context, dir string) error {
 	remove := func() { _ = os.RemoveAll(dir) }
 	for _, d := range nixStateDirs {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
-			return "", nil, err
+			return err
 		}
 	}
 	// The schema file says which version of the database this is.
 	if b, err := os.ReadFile(filepath.Join(filepath.Dir(n.database()), "schema")); err == nil {
 		if err := os.WriteFile(filepath.Join(dir, "db", "schema"), b, 0o644); err != nil {
 			remove()
-			return "", nil, err
+			return err
 		}
 	}
 	// VACUUM INTO writes one consistent file, including what the host's Nix has not yet
@@ -98,15 +107,17 @@ func (n *HostNix) Snapshot(ctx context.Context, id string) (string, func(), erro
 		"VACUUM INTO '"+strings.ReplaceAll(out, "'", "''")+"'")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		remove()
-		return "", nil, fmt.Errorf("copying the Nix database: %v: %s", err, strings.TrimSpace(string(b)))
+		return fmt.Errorf("copying the Nix database: %v: %s", err, strings.TrimSpace(string(b)))
 	}
-	return dir, remove, nil
+	return nil
 }
 
 // nixSetup is the part of a runner's entry command that points Nix in the guest at what the
 // host offers: the host's own store, read-only (HostNix), and a place in the job's cache
 // where builds are kept for later jobs of the same repository. SHARES is the directory the
-// guest has the host's shares in, and SHARES_URL the same as it is written in a URL.
+// guest has the host's shares in, and SHARES_URL the same as it is written in a URL;
+// NIX_STATE is the copy of the host's database for this job, and NIX_STATE_URL the same in a
+// URL.
 //
 // Both are sources Nix takes paths from instead of building or downloading them, tried
 // before the public cache. Neither is signed. The host's store is the owner's; the cache
@@ -135,8 +146,8 @@ func (n *HostNix) Snapshot(ctx context.Context, id string) (string, func(), erro
 const nixSetup = `mcc_nix() {
   local conf="" subs=""
   hook=/etc/nix/mcc-built
-  if [ -r "$SHARES/` + nixStateShare + `/db/db.sqlite" ] && [ -d "$SHARES/` + nixStoreShare + `" ]; then
-    subs="local?store=/nix/store&real=$SHARES_URL/` + nixStoreShare + `&state=$SHARES_URL/` + nixStateShare + `&read-only=true&trusted=true&priority=10"
+  if [ -r "$NIX_STATE/db/db.sqlite" ] && [ -d "$SHARES/` + nixStoreShare + `" ]; then
+    subs="local?store=/nix/store&real=$SHARES_URL/` + nixStoreShare + `&state=$NIX_STATE_URL&read-only=true&trusted=true&priority=10"
     conf="extra-experimental-features = read-only-local-store
 "
   fi

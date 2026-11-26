@@ -135,6 +135,11 @@ type Policy struct {
 	// Nix in the VM copies what the host already has instead of building or downloading it.
 	// Every job on the host can then read everything in the store.
 	ShareNixStore bool `json:"share_nix_store"`
+	// WarmVMs is the most VMs the host keeps booted and waiting for its pools, so that a job
+	// starts without waiting for a boot: 0 for none. A pool's warm VMs are shared out among
+	// its hosts, and this is the most this host is given. A waiting VM holds one of max_vms and
+	// the memory it was given. Unset means as many as max_vms.
+	WarmVMs *int `json:"warm_vms"`
 	// HostTasks lets work run on this host itself, without a virtual machine. Off unless the
 	// owner turns it on: such work is not isolated from the host.
 	HostTasks HostTasks `json:"host_tasks"`
@@ -370,9 +375,17 @@ func boolOr(p *bool, d bool) bool {
 	return *p
 }
 
-func (p Policy) StayAwakeEnabled() bool      { return boolOr(p.StayAwake, true) }
-func (p Policy) NetworkIsolation() bool      { return boolOr(p.IsolateNetwork, true) }
-func (p Policy) SharedRunnerEnabled() bool   { return boolOr(p.SharedRunner, true) }
+func (p Policy) StayAwakeEnabled() bool    { return boolOr(p.StayAwake, true) }
+func (p Policy) NetworkIsolation() bool    { return boolOr(p.IsolateNetwork, true) }
+func (p Policy) SharedRunnerEnabled() bool { return boolOr(p.SharedRunner, true) }
+
+// WarmVMsMax is the most warm VMs the owner allows: never more than max_vms.
+func (p Policy) WarmVMsMax() int {
+	if p.WarmVMs == nil {
+		return p.MaxVMs
+	}
+	return max(0, min(*p.WarmVMs, p.MaxVMs))
+}
 func (p Policy) ImageRefresh() time.Duration { return time.Duration(p.ImageRefreshHours) * time.Hour }
 
 // DefaultPolicy is used when policy.json does not exist.
@@ -405,6 +418,9 @@ func LoadPolicy(dir string) (Policy, error) {
 }
 
 func (p Policy) Validate() error {
+	if p.WarmVMs != nil && *p.WarmVMs < 0 {
+		return fmt.Errorf("policy: warm_vms must not be negative")
+	}
 	if p.MaxVMs < 0 {
 		return fmt.Errorf("policy: max_vms must not be negative")
 	}

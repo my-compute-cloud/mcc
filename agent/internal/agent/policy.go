@@ -52,3 +52,11 @@ func policyReport(p config.Policy, isolationOK bool) protocol.HostPolicy {
 		UpgradeWaitMinutes:      int(p.UpgradeWait().Minutes()),
 	}
 }
+
+// policyReport is the cloud's policy as its control plane is told it, with what the machine can
+// do in place of what the file asks where the two differ.
+func (c *cloud) policyReport() protocol.HostPolicy {
+	r := policyReport(c.o.Policy, c.isolationOK)
+	r.WarmVms = c.a.warmMax()
+	return r
+}

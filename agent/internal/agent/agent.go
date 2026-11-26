@@ -39,6 +39,9 @@ var Version = "dev"
 // on which repository or organization the job's runner registers with.
 type CacheSource interface {
 	Acquire(githubURL string) (dir string, release func(), err error)
+	// Lend puts a clone of the cache at into instead, for a VM booted before its job, and
+	// returns what puts back what the job added (cache.Manager.Lend).
+	Lend(githubURL, into string) (giveBack func(), err error)
 	Prune()
 }
 
@@ -82,6 +85,9 @@ type Options struct {
 	// HostNix is the host's Nix store, shared read-only with jobs. Nil unless the owner
 	// turned that on and the host has one.
 	HostNix *HostNix
+	// SlotDir holds the slots of VMs that are booted before their job (warm.go), on the volume
+	// of the job caches. Empty boots each VM for its job, with its shares then.
+	SlotDir string
 	// TaskOutput keeps what tasks print. Nil keeps nothing.
 	TaskOutput *tasklog.Store
 	// OutputAddress and OutputPin are where callers on other machines read a task's output
@@ -143,6 +149,8 @@ type Agent struct {
 	local       bool              // true for a build its owner put in the service's place
 	wg          sync.WaitGroup
 	isolationOK bool
+	// warm is the machine's warm VMs; nil without SlotDir.
+	warm *warmPool
 }
 
 // cloud is the agent's side of one enrollment: a connection to that cloud's control plane, the
@@ -164,6 +172,7 @@ type cloud struct {
 	assignments map[string]*assignment
 	images      map[string]protocol.ImageSpec // by name, as configured by the control plane
 	pooled      map[string]bool               // image name -> a pool of this host is set to it
+	warm        map[string]int                // image name -> warm VMs its pools ask for
 	ready       map[string]bool               // image name -> prepared
 	conn        *websocket.Conn
 	connCtx     context.Context
@@ -189,6 +198,9 @@ func New(o Options) *Agent {
 		switches:    make(chan switchTo, 1),
 		local:       os.Getenv(localEnv) != "",
 		isolationOK: o.Executor.NetworkIsolationAvailable(),
+	}
+	if o.SlotDir != "" {
+		a.warm = newWarmPool(a, o.SlotDir)
 	}
 	enrolled := o.Clouds
 	if len(enrolled) == 0 {
@@ -241,6 +253,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.mu.Unlock()
 	a.cleanupLeftovers(ctx)
 	go a.refreshLoop(ctx)
+	if a.warm != nil {
+		go a.warmLoop(ctx)
+	}
 
 	// One cloud that cannot be reached, or that has revoked this host, costs the others nothing.
 	var connections sync.WaitGroup
@@ -302,6 +317,9 @@ func (a *Agent) cleanupLeftovers(ctx context.Context) {
 }
 
 func (a *Agent) shutdown() {
+	if a.warm != nil {
+		a.warm.stopAll()
+	}
 	a.mu.Lock()
 	for _, c := range a.clouds {
 		for _, as := range c.assignments {
@@ -370,7 +388,7 @@ func (c *cloud) session(ctx context.Context) error {
 		// The policy is read when the agent starts and a change to it restarts the agent, so
 		// what each connection opens with is the policy in force. Each cloud is told the policy
 		// that governs its own work here, and nothing of what another cloud may do.
-		Policy: policyReport(c.o.Policy, c.isolationOK),
+		Policy: c.policyReport(),
 	}
 	if err := write(sctx, conn, &hello); err != nil {
 		return err
@@ -744,6 +762,7 @@ func (c *cloud) sendCapacity() {
 	}
 	c.send(&protocol.Capacity{
 		Type: protocol.TypeCapacity, SlotsTotal: total, SlotsFree: free, ImagesReady: ready, Accepting: c.accepting(), Guests: guests,
+		ImagesWarm:     c.warmImages(c.connCtxOr()),
 		HostSlotsTotal: c.hostSlots(), HostSlotsFree: c.freeHostSlots(), Tasks: c.declaredTasks(),
 		OutputAddress: c.o.OutputAddress, OutputPin: c.o.OutputPin, OutputKey: c.outputKey(),
 		Scripts:  c.o.Policy.WorkloadAllowed("script"),
@@ -761,9 +780,11 @@ func (c *cloud) applyConfig(ctx context.Context, pools []protocol.PoolConfig, im
 		c.images[img.Name] = img
 	}
 	c.pooled = map[string]bool{}
+	c.warm = map[string]int{}
 	for _, p := range pools {
 		if p.Image != "" {
 			c.pooled[p.Image] = true
+			c.warm[p.Image] += max(0, p.WarmVms)
 		}
 	}
 	for name := range c.ready {
@@ -779,6 +800,7 @@ func (c *cloud) applyConfig(ctx context.Context, pools []protocol.PoolConfig, im
 		}
 	}
 	c.prepareMissing(ctx)
+	c.a.refillWarm()
 }
 
 // prepareMissing starts fetching each image the control plane wants, the owner allows and the
@@ -834,6 +856,7 @@ func (c *cloud) prepareAsync(ctx context.Context, img protocol.ImageSpec) {
 		}
 		c.log.Info("image ready", "image", img.Name)
 		c.sendCapacity()
+		c.a.refillWarm()
 		for _, other := range c.a.clouds {
 			if other != c {
 				other.prepareMissing(ctx)
@@ -893,4 +916,37 @@ func (a *Agent) refreshLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// refillWarm brings the warm VMs to what the pools ask for, without waiting.
+func (a *Agent) refillWarm() {
+	if a.warm != nil {
+		go a.warm.refill()
+	}
+}
+
+// warmLoop looks at the warm VMs from time to time, for what no message announces: active
+// hours that began or ended, a newer runner, an image refreshed.
+func (a *Agent) warmLoop(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.warm.refill()
+		}
+	}
+}
+
+// connCtxOr is the context of this cloud's connection, or a background one before there is
+// a connection.
+func (c *cloud) connCtxOr() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.connCtx != nil {
+		return c.connCtx
+	}
+	return context.Background()
 }

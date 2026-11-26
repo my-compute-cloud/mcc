@@ -15,6 +15,7 @@ import (
 
 type Fake struct {
 	mu       sync.Mutex
+	commands map[string][]string
 	prepared map[string]bool
 	vms      map[string]executor.Handle
 	Started  []string
@@ -35,10 +36,19 @@ type Fake struct {
 	FailStart error
 	// Block makes Exec wait until its context ends.
 	Block bool
+	// Late makes it an executor whose macOS guests see what the host puts in a share after
+	// boot (executor.LateShares), as Tart's do.
+	Late bool
+	// Version is what BaseVersion says of every image.
+	Version string
+	// StartDelay is how long Start takes, as a boot does.
+	StartDelay time.Duration
+	// During is called in Exec, as what runs in the machine would do its work.
+	During func(h executor.Handle, script string)
 }
 
 func New() *Fake {
-	return &Fake{prepared: map[string]bool{}, vms: map[string]executor.Handle{}, Stdin: map[string]string{}, Options: map[string]executor.StartOptions{}, Scripts: map[string]string{}, TakeJob: true}
+	return &Fake{commands: map[string][]string{}, prepared: map[string]bool{}, vms: map[string]executor.Handle{}, Stdin: map[string]string{}, Options: map[string]executor.StartOptions{}, Scripts: map[string]string{}, TakeJob: true}
 }
 
 func (f *Fake) Prepare(_ context.Context, image protocol.ImageSpec) error {
@@ -58,7 +68,17 @@ func (f *Fake) Ready(_ context.Context, image protocol.ImageSpec) bool {
 	return f.prepared[image.Source]
 }
 
-func (f *Fake) Start(_ context.Context, id string, image protocol.ImageSpec, opts executor.StartOptions) (executor.Handle, error) {
+func (f *Fake) Start(ctx context.Context, id string, image protocol.ImageSpec, opts executor.StartOptions) (executor.Handle, error) {
+	f.mu.Lock()
+	delay := f.StartDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return executor.Handle{AssignmentID: id, Name: "mcc-" + id}, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Options[id] = opts
@@ -77,6 +97,7 @@ func (f *Fake) Start(_ context.Context, id string, image protocol.ImageSpec, opt
 func (f *Fake) Exec(ctx context.Context, h executor.Handle, c executor.Command) (int, error) {
 	f.mu.Lock()
 	f.Scripts[h.AssignmentID] = c.Script
+	f.commands[h.AssignmentID] = append(f.commands[h.AssignmentID], c.Script)
 	f.mu.Unlock()
 	if c.Stdin != nil {
 		b, _ := io.ReadAll(c.Stdin)
@@ -87,6 +108,12 @@ func (f *Fake) Exec(ctx context.Context, h executor.Handle, c executor.Command) 
 	out := c.Output
 	if out == nil {
 		out = io.Discard
+	}
+	f.mu.Lock()
+	during := f.During
+	f.mu.Unlock()
+	if during != nil {
+		during(h, c.Script)
 	}
 	fmt.Fprintln(out, "√ Connected to GitHub")
 	if f.Block {
@@ -133,6 +160,32 @@ func (f *Fake) Running() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.vms)
+}
+
+func (f *Fake) LateShares(image protocol.ImageSpec) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Late && image.Platform != "linux"
+}
+
+func (f *Fake) BaseVersion(context.Context, protocol.ImageSpec) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Version
+}
+
+// SetVersion changes what BaseVersion says, as a refreshed image would.
+func (f *Fake) SetVersion(v string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Version = v
+}
+
+// Commands are the commands run in a machine, in order; Scripts keeps only the last.
+func (f *Fake) Commands(id string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.commands[id]...)
 }
 
 func (f *Fake) NetworkIsolationAvailable() bool { return true }
